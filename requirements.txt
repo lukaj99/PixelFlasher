@@ -27,3 +27,6 @@ polib>=1.1.1
 wxPython==4.2.2
 # # wxPython==4.2.1; platform_system == "Linux"
 # # wxPython>=4.2.1; platform_system != "Linux"
+# MCP server dependencies (optional — only needed for AI agent integration)
+mcp>=1.12.0
+pydantic>=2.0

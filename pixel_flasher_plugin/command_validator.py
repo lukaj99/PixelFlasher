@@ -1,0 +1,124 @@
+"""Command whitelist and partition blocklist (safety Layers 2 and 3)."""
+from __future__ import annotations
+
+import re
+
+# constants.py lives in the parent project directory. When the MCP server runs from
+# the project root, `import constants` resolves correctly.
+import constants  # type: ignore[import-not-found]
+
+
+class CommandValidator:
+    ALLOWED_ADB_COMMANDS = [
+        re.compile(r"^adb\s+devices(-l)?$"),
+        re.compile(r"^adb\s+-s\s+\S+\s+shell\s+getprop\s+\S+$"),
+        re.compile(r"^adb\s+-s\s+\S+\s+shell\s+pm\s+list\s+packages(-\S+)?$"),
+        re.compile(r"^adb\s+-s\s+\S+\s+shell\s+pm\s+path\s+\S+$"),
+        re.compile(r"^adb\s+-s\s+\S+\s+shell\s+pm\s+(enable|disable)\s+\S+$"),
+        re.compile(r"^adb\s+-s\s+\S+\s+shell\s+pm\s+(grant|revoke)\s+\S+\s+\S+$"),
+        re.compile(r"^adb\s+-s\s+\S+\s+shell\s+dumpsys(\s+\S+)*$"),
+        re.compile(r"^adb\s+-s\s+\S+\s+shell\s+logcat(\s+\S+)*$"),
+        re.compile(r"^adb\s+-s\s+\S+\s+shell\s+(uname|ls|cat|stat)(\s+\S+)*$"),
+        re.compile(r"^adb\s+-s\s+\S+\s+(install|uninstall|push|pull|reboot|wait-for-\S+|get-state)(\s+\S+)*$"),
+        # Host-side redirect used by read_partition; partition is sanitized before
+        # this pattern is reached.
+        re.compile(r"^adb\s+-s\s+\S+\s+shell\s+cat\s+\S+\s*>\s*\S+$"),
+    ]
+
+    ALLOWED_FASTBOOT_COMMANDS = [
+        re.compile(r"^fastboot\s+devices$"),
+        re.compile(r"^fastboot\s+-s\s+\S+\s+getvar(\s+\S+)*$"),
+        re.compile(r"^fastboot\s+-s\s+\S+\s+flash\s+\S+\s+\S+$"),
+        re.compile(r"^fastboot\s+-s\s+\S+\s+erase\s+\S+$"),
+        re.compile(r"^fastboot\s+-s\s+\S+\s+reboot(-bootloader)?$"),
+        re.compile(
+            r"^fastboot\s+-s\s+\S+\s+flashing\s+"
+            r"(unlock|lock|get_unlock_ability|unlock_critical|lock_critical)$"
+        ),
+        re.compile(r"^fastboot\s+-s\s+\S+\s+oem\s+\S+$"),
+    ]
+
+    BLOCKED_PARTITIONS = {
+        "xbl",
+        "xbl_config",
+        "abl",
+        "aop",
+        "devcfg",
+        "hyp",
+        "keymaster",
+        "qupfw",
+        "tz",
+        "uefisecapp",
+        "multiimgoem",
+        "multiimgqti",
+        "cpucp",
+        "shrm",
+        "storsec",
+        "spunvm",
+        "modem",
+    }
+
+    ALLOWED_PARTITIONS = {
+        "boot",
+        "init_boot",
+        "vendor_boot",
+        "dtbo",
+        "vbmeta",
+        "vbmeta_system",
+        "system",
+        "vendor",
+        "product",
+        "system_ext",
+        "userdata",
+        "cache",
+        "super",
+        "metadata",
+    }
+
+    _SLOT_SUFFIX = re.compile(r"_[ab]$")
+
+    @classmethod
+    def is_allowed(cls, cmd: str) -> tuple[bool, str]:
+        """Return (allowed, reason). Empty reason means the command is allowed."""
+        stripped = cmd.strip()
+        matched = False
+        for pattern in cls.ALLOWED_ADB_COMMANDS:
+            if pattern.match(stripped):
+                matched = True
+                break
+        if not matched:
+            for pattern in cls.ALLOWED_FASTBOOT_COMMANDS:
+                if pattern.match(stripped):
+                    matched = True
+                    break
+        if not matched:
+            return False, "Command does not match the ADB/fastboot whitelist."
+
+        # For flash/erase commands, extract and validate the partition name.
+        partition = cls._extract_partition(stripped)
+        if partition is not None:
+            normalized = cls._normalize_partition(partition)
+            if cls.is_partition_blocked(normalized):
+                return False, f"Partition '{partition}' is firmware-critical and blocked."
+            if normalized not in cls.ALLOWED_PARTITIONS:
+                return False, f"Partition '{partition}' is not in the allowed partition list."
+        return True, ""
+
+    @classmethod
+    def _extract_partition(cls, cmd: str) -> str | None:
+        """Pull the partition name out of a fastboot flash/erase command."""
+        tokens = cmd.split()
+        for i, token in enumerate(tokens):
+            if token in ("flash", "erase") and i + 1 < len(tokens):
+                return tokens[i + 1].strip("\"'")
+        return None
+
+    @classmethod
+    def _normalize_partition(cls, partition: str) -> str:
+        """Strip A/B slot suffix for validation."""
+        return cls._SLOT_SUFFIX.sub("", partition)
+
+    @classmethod
+    def is_partition_blocked(cls, partition: str) -> bool:
+        """True if the partition (ignoring slot suffix) is firmware-critical."""
+        return cls._normalize_partition(partition) in cls.BLOCKED_PARTITIONS
