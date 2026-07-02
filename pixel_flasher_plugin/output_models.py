@@ -1,4 +1,4 @@
-"""Pydantic BaseModel output schemas for the 28-tool MCP catalog."""
+"""Pydantic BaseModel output schemas for the 34-tool MCP catalog."""
 from __future__ import annotations
 
 from pydantic import BaseModel, Field
@@ -232,6 +232,50 @@ class RebootOutput(BaseModel):
 class BootloaderOutput(BaseModel):
     success: bool = Field(description="Whether the bootloader command succeeded")
     unlocked: bool | None = Field(default=None, description="Current bootloader lock state")
+    dry_run: bool = Field(default=True, description="Whether this was a dry run")
+    warnings: list[str] = Field(default_factory=list, description="Non-fatal warnings")
+
+
+class ModuleListEntry(BaseModel):
+    id: str = Field(description="Module ID")
+    name: str = Field(description="Module name")
+    version: str = Field(description="Module version string")
+    state: str = Field(description="enabled | disabled | remove")
+    has_action: bool = Field(description="Whether the module exposes an action.sh script")
+
+
+class ModuleListOutput(BaseModel):
+    modules: list[ModuleListEntry] = Field(description="Installed modules")
+    count: int = Field(description="Number of modules")
+    root_solution: str | None = Field(default=None, description="Detected root solution")
+
+
+class ModuleInstallOutput(BaseModel):
+    success: bool = Field(description="Whether the install succeeded")
+    module_path: str | None = Field(default=None, description="Local module zip path")
+    module_name: str | None = Field(default=None, description="Module file name pushed to the device")
+    dry_run: bool = Field(default=True, description="Whether this was a dry run")
+    warnings: list[str] = Field(default_factory=list, description="Non-fatal warnings")
+
+
+class ModuleUninstallOutput(BaseModel):
+    success: bool = Field(description="Whether the uninstall succeeded")
+    module_id: str | None = Field(default=None, description="Module ID")
+    dry_run: bool = Field(default=True, description="Whether this was a dry run")
+    warnings: list[str] = Field(default_factory=list, description="Non-fatal warnings")
+
+
+class ModuleStateOutput(BaseModel):
+    success: bool = Field(description="Whether the state change succeeded")
+    module_id: str | None = Field(default=None, description="Module ID")
+    current_state: str | None = Field(default=None, description="State after the operation")
+    dry_run: bool = Field(default=True, description="Whether this was a dry run")
+    warnings: list[str] = Field(default_factory=list, description="Non-fatal warnings")
+
+
+class ModuleActionOutput(BaseModel):
+    success: bool = Field(description="Whether the action script ran")
+    module_id: str | None = Field(default=None, description="Module ID")
     dry_run: bool = Field(default=True, description="Whether this was a dry run")
     warnings: list[str] = Field(default_factory=list, description="Non-fatal warnings")
 

@@ -16,6 +16,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import zipfile
 from typing import Any, ClassVar
 
 from pixel_flasher_plugin import command_validator, telemetry
@@ -1435,6 +1436,442 @@ class DeviceOps:
                 os.remove(local_tmp)
             except Exception:
                 pass
+
+    # ------------------------------------------------------------------
+    # SOTA / root module operations
+    # ------------------------------------------------------------------
+    _MODULE_ID_RE: ClassVar[re.Pattern[str]] = re.compile(r"^[a-zA-Z0-9_.-]+$")
+
+    def _module_manager(self, dev: Any) -> str:
+        """Return the module CLI name for the device's root solution."""
+        su = str(getattr(dev, "su_version", "")).lower()
+        if "kernelsu" in su or "sukisu" in su or "wild_ksu" in su:
+            return "ksud"
+        if "apatch" in su:
+            return "apd"
+        return "magisk"
+
+    def _build_module_command(self, inner: str) -> str:
+        """Build a canonical ``adb -s <id> shell su -c '<inner>'`` string."""
+        return self._adb_cmd(f"shell su -c {self._q(inner)}")
+
+    def _validate_module_id(self, module_id: str) -> ToolResult | None:
+        """Return a ToolResult error if *module_id* contains unsafe characters."""
+        if not module_id or not self._MODULE_ID_RE.match(module_id):
+            return ToolResult(
+                success=False,
+                error=f"Invalid module_id: {module_id!r}. Only [a-zA-Z0-9_.-] is allowed.",
+            )
+        return None
+
+    def _get_modules(self, dev: Any) -> tuple[list[dict[str, Any]], str]:
+        """Return (modules, root_solution) by auto-detecting the root solution."""
+        su = str(getattr(dev, "su_version", ""))
+        su_lower = su.lower()
+        if "magisk" in su_lower:
+            modules = dev.get_magisk_detailed_modules()
+            return modules, su
+        if "kernelsu" in su_lower:
+            modules = dev.get_ksu_detailed_modules()
+            return modules, su
+        if "sukisu" in su_lower:
+            modules = dev.get_sukisu_detailed_modules()
+            return modules, su
+        if "wild_ksu" in su_lower:
+            modules = dev.get_wild_ksu_detailed_modules()
+            return modules, su
+        if "apatch" in su_lower:
+            modules = dev.get_apatch_detailed_modules()
+            return modules, su
+        raise ValueError(f"Unrecognized root solution: {su!r}")
+
+    def list_modules(self) -> ToolResult:
+        """List installed root modules, auto-detecting the root solution."""
+        try:
+            dev = self._lazy_device()
+            if not getattr(dev, "rooted", False):
+                return ToolResult(
+                    success=False,
+                    error="Device is not rooted; cannot list modules.",
+                )
+            modules, root_solution = self._get_modules(dev)
+            entries = [
+                {
+                    "id": getattr(m, "id", ""),
+                    "name": getattr(m, "name", ""),
+                    "version": getattr(m, "version", ""),
+                    "state": getattr(m, "state", "enabled"),
+                    "has_action": bool(getattr(m, "hasAction", False)),
+                }
+                for m in modules or []
+            ]
+            self._log("list_modules", None, True)
+            return ToolResult(
+                success=True,
+                data={
+                    "modules": entries,
+                    "count": len(entries),
+                    "root_solution": root_solution,
+                },
+            )
+        except Exception as exc:
+            self._log("list_modules", None, False)
+            return self._tool_error("list_modules", exc)
+
+    def install_module(
+        self,
+        module_path: str,
+        dry_run: bool = True,
+        confirm: bool = False,
+    ) -> ToolResult:
+        """Install a local module zip on the device."""
+        try:
+            dev = self._lazy_device()
+            if not getattr(dev, "rooted", False):
+                return ToolResult(
+                    success=False,
+                    error="Device is not rooted; cannot install modules.",
+                )
+
+            module_path = module_path.strip()
+            if module_path.lower().startswith(("http://", "https://")):
+                return ToolResult(
+                    success=False,
+                    error="URL module download is not supported in this release; please download the zip locally first.",
+                )
+
+            resolved = os.path.abspath(os.path.expanduser(module_path))
+            if not os.path.isfile(resolved):
+                return ToolResult(
+                    success=False,
+                    error=f"Module zip not found: {resolved}",
+                )
+            if not zipfile.is_zipfile(resolved):
+                return ToolResult(
+                    success=False,
+                    error=f"File is not a valid zip archive: {resolved}",
+                )
+
+            module_name = os.path.basename(resolved)
+            manager = self._module_manager(dev)
+            if manager == "magisk":
+                inner = f"magisk --install-module /sdcard/Download/{module_name}"
+            else:
+                inner = f"{manager} module install /sdcard/Download/{module_name}"
+            command = self._build_module_command(inner)
+
+            # Dry-run previews still pass the whitelist gate; execution requires
+            # the real confirm value.
+            blocked = self._evaluate(
+                command,
+                RiskTier.WARN,
+                confirm=True if dry_run else confirm,
+            )
+            if blocked:
+                self._log("install_module", command, False)
+                return blocked
+
+            if dry_run:
+                self._log("install_module", command, True)
+                return ToolResult(
+                    success=True,
+                    dry_run=True,
+                    data={
+                        "module_path": resolved,
+                        "module_name": module_name,
+                    },
+                    command=command,
+                    warnings=["Dry run - no changes made"],
+                )
+
+            preflight = self._run_preflight(RiskTier.WARN, expected_mode="adb")
+            if preflight:
+                self._log("install_module", command, False)
+                return preflight
+
+            rc = dev.magisk_install_module(resolved)
+            success = rc == 0
+            self._log("install_module", command, success)
+            if not success:
+                return ToolResult(
+                    success=False,
+                    error=f"magisk_install_module returned {rc}",
+                    command=command,
+                )
+            return ToolResult(
+                success=True,
+                data={"module_path": resolved, "module_name": module_name},
+                command=command,
+            )
+        except Exception as exc:
+            self._log("install_module", None, False)
+            return self._tool_error("install_module", exc)
+
+    def uninstall_module(
+        self,
+        module_id: str,
+        dry_run: bool = True,
+        confirm: bool = False,
+    ) -> ToolResult:
+        """Uninstall (mark for removal) a root module."""
+        invalid = self._validate_module_id(module_id)
+        if invalid:
+            return invalid
+
+        try:
+            dev = self._lazy_device()
+            manager = self._module_manager(dev)
+            if manager in ("ksud", "apd"):
+                inner = f"{manager} module uninstall {module_id}"
+            else:
+                inner = f"touch /data/adb/modules/{module_id}/remove"
+            command = self._build_module_command(inner)
+
+            if dry_run:
+                modules = self.list_modules()
+                if not modules.success:
+                    return modules
+                ids = {m.get("id") for m in modules.data.get("modules", [])}
+                if module_id not in ids:
+                    return ToolResult(
+                        success=False,
+                        error=f"Module {module_id!r} is not installed",
+                    )
+
+            blocked = self._evaluate(
+                command,
+                RiskTier.WARN,
+                confirm=True if dry_run else confirm,
+            )
+            if blocked:
+                self._log("uninstall_module", command, False)
+                return blocked
+
+            if dry_run:
+                self._log("uninstall_module", command, True)
+                return ToolResult(
+                    success=True,
+                    dry_run=True,
+                    data={"module_id": module_id},
+                    command=command,
+                    warnings=["Dry run - no changes made"],
+                )
+
+            preflight = self._run_preflight(RiskTier.WARN, expected_mode="adb")
+            if preflight:
+                self._log("uninstall_module", command, False)
+                return preflight
+
+            rc = dev.magisk_uninstall_module(module_id)
+            success = rc == 0
+            self._log("uninstall_module", command, success)
+            if not success:
+                return ToolResult(
+                    success=False,
+                    error=f"magisk_uninstall_module returned {rc}",
+                    command=command,
+                )
+            return ToolResult(
+                success=True,
+                data={"module_id": module_id},
+                command=command,
+            )
+        except Exception as exc:
+            self._log("uninstall_module", None, False)
+            return self._tool_error("uninstall_module", exc)
+
+    def enable_module(
+        self,
+        module_id: str,
+        dry_run: bool = True,
+        confirm: bool = False,
+    ) -> ToolResult:
+        """Enable a previously disabled root module."""
+        invalid = self._validate_module_id(module_id)
+        if invalid:
+            return invalid
+
+        try:
+            dev = self._lazy_device()
+            inner = f"rm -f /data/adb/modules/{module_id}/disable"
+            command = self._build_module_command(inner)
+
+            blocked = self._evaluate(
+                command,
+                RiskTier.WARN,
+                confirm=True if dry_run else confirm,
+            )
+            if blocked:
+                self._log("enable_module", command, False)
+                return blocked
+
+            if dry_run:
+                self._log("enable_module", command, True)
+                return ToolResult(
+                    success=True,
+                    dry_run=True,
+                    data={"module_id": module_id, "current_state": "enabled"},
+                    command=command,
+                    warnings=["Dry run - no changes made"],
+                )
+
+            preflight = self._run_preflight(RiskTier.WARN, expected_mode="adb")
+            if preflight:
+                self._log("enable_module", command, False)
+                return preflight
+
+            rc = dev.enable_magisk_module(module_id)
+            success = rc == 0
+            self._log("enable_module", command, success)
+            if not success:
+                return ToolResult(
+                    success=False,
+                    error=f"enable_magisk_module returned {rc}",
+                    command=command,
+                )
+            return ToolResult(
+                success=True,
+                data={"module_id": module_id, "current_state": "enabled"},
+                command=command,
+            )
+        except Exception as exc:
+            self._log("enable_module", None, False)
+            return self._tool_error("enable_module", exc)
+
+    def disable_module(
+        self,
+        module_id: str,
+        dry_run: bool = True,
+        confirm: bool = False,
+    ) -> ToolResult:
+        """Disable a root module."""
+        invalid = self._validate_module_id(module_id)
+        if invalid:
+            return invalid
+
+        try:
+            dev = self._lazy_device()
+            inner = f"touch /data/adb/modules/{module_id}/disable"
+            command = self._build_module_command(inner)
+
+            blocked = self._evaluate(
+                command,
+                RiskTier.WARN,
+                confirm=True if dry_run else confirm,
+            )
+            if blocked:
+                self._log("disable_module", command, False)
+                return blocked
+
+            if dry_run:
+                self._log("disable_module", command, True)
+                return ToolResult(
+                    success=True,
+                    dry_run=True,
+                    data={"module_id": module_id, "current_state": "disabled"},
+                    command=command,
+                    warnings=["Dry run - no changes made"],
+                )
+
+            preflight = self._run_preflight(RiskTier.WARN, expected_mode="adb")
+            if preflight:
+                self._log("disable_module", command, False)
+                return preflight
+
+            rc = dev.disable_magisk_module(module_id)
+            success = rc == 0
+            self._log("disable_module", command, success)
+            if not success:
+                return ToolResult(
+                    success=False,
+                    error=f"disable_magisk_module returned {rc}",
+                    command=command,
+                )
+            return ToolResult(
+                success=True,
+                data={"module_id": module_id, "current_state": "disabled"},
+                command=command,
+            )
+        except Exception as exc:
+            self._log("disable_module", None, False)
+            return self._tool_error("disable_module", exc)
+
+    def run_module_action(
+        self,
+        module_id: str,
+        dry_run: bool = True,
+        confirm: bool = False,
+    ) -> ToolResult:
+        """Run a module's action.sh script."""
+        invalid = self._validate_module_id(module_id)
+        if invalid:
+            return invalid
+
+        try:
+            dev = self._lazy_device()
+            inner = f"busybox sh -o standalone /data/adb/modules/{module_id}/action.sh"
+            command = self._build_module_command(inner)
+
+            if dry_run:
+                modules = self.list_modules()
+                if not modules.success:
+                    return modules
+                entry = next(
+                    (m for m in modules.data.get("modules", []) if m.get("id") == module_id),
+                    None,
+                )
+                if entry is None:
+                    return ToolResult(
+                        success=False,
+                        error=f"Module {module_id!r} is not installed",
+                    )
+                if not entry.get("has_action"):
+                    return ToolResult(
+                        success=False,
+                        error=f"Module {module_id!r} does not have an action.sh script",
+                    )
+
+            blocked = self._evaluate(
+                command,
+                RiskTier.WARN,
+                confirm=True if dry_run else confirm,
+            )
+            if blocked:
+                self._log("run_module_action", command, False)
+                return blocked
+
+            if dry_run:
+                self._log("run_module_action", command, True)
+                return ToolResult(
+                    success=True,
+                    dry_run=True,
+                    data={"module_id": module_id},
+                    command=command,
+                    warnings=["Dry run - no changes made"],
+                )
+
+            preflight = self._run_preflight(RiskTier.WARN, expected_mode="adb")
+            if preflight:
+                self._log("run_module_action", command, False)
+                return preflight
+
+            rc = dev.magisk_run_module_action(module_id)
+            success = rc == 0
+            self._log("run_module_action", command, success)
+            if not success:
+                return ToolResult(
+                    success=False,
+                    error=f"magisk_run_module_action returned {rc}",
+                    command=command,
+                )
+            return ToolResult(
+                success=True,
+                data={"module_id": module_id},
+                command=command,
+            )
+        except Exception as exc:
+            self._log("run_module_action", None, False)
+            return self._tool_error("run_module_action", exc)
 
     # ------------------------------------------------------------------
     # Backup listing (read-only)

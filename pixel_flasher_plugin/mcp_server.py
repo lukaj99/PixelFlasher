@@ -1,6 +1,6 @@
 """PixelFlasher MCP server adapter.
 
-This module exposes the PixelFlasher device-operation facade as 28 MCP tools
+This module exposes the PixelFlasher device-operation facade as 34 MCP tools
 that AI agents can call.  It bootstraps the headless runtime once at startup
 and shares the same SafetyGateway across all tool invocations.
 """
@@ -35,6 +35,11 @@ from pixel_flasher_plugin.output_models import (
     DeviceListOutput,
     FactoryFlashOutput,
     LogcatOutput,
+    ModuleActionOutput,
+    ModuleInstallOutput,
+    ModuleListOutput,
+    ModuleStateOutput,
+    ModuleUninstallOutput,
     PackageInstallOutput,
     PackageListEntry,
     PackageListOutput,
@@ -711,6 +716,169 @@ def check_play_integrity(
     """
     result = _ops(device_id, ctx).check_play_integrity()
     return _to_output(result, PlayIntegrityOutput)
+
+
+# ---------------------------------------------------------------------------
+# Category 10 — SOTA Module Management
+# ---------------------------------------------------------------------------
+@mcp.tool()
+def list_modules(ctx: Context, device_id: str) -> ModuleListOutput:
+    """List installed root modules (Magisk/KernelSU/APatch). INFO operation."""
+    result = _ops(device_id, ctx).list_modules()
+    return _to_output(result, ModuleListOutput)
+
+
+@mcp.tool()
+def install_module(
+    ctx: Context,
+    device_id: str,
+    module_path: str,
+    dry_run: bool = True,
+    confirm: bool = False,
+) -> ModuleInstallOutput:
+    """Install a local module zip on the device. WARN operation.
+
+    Defaults to dry_run=True (preview mode). To execute, pass dry_run=False
+    AND confirm=True. URL module downloads are not supported in this release.
+    """
+    ops = _ops(device_id, ctx)
+    if dry_run:
+        result = ops.install_module(module_path, dry_run=True, confirm=False)
+        return _to_output(_as_preview(result), ModuleInstallOutput)
+    if not confirm:
+        return _refuse_confirm(ModuleInstallOutput, "WARN")
+    result = ops.install_module(module_path, dry_run=False, confirm=True)
+    return _to_output(
+        result,
+        ModuleInstallOutput,
+        data={
+            "success": result.success,
+            "module_path": (result.data or {}).get("module_path") if result.success else None,
+            "module_name": (result.data or {}).get("module_name") if result.success else None,
+        },
+    )
+
+
+@mcp.tool()
+def uninstall_module(
+    ctx: Context,
+    device_id: str,
+    module_id: str,
+    dry_run: bool = True,
+    confirm: bool = False,
+) -> ModuleUninstallOutput:
+    """Uninstall (mark for removal) a root module. WARN operation.
+
+    Defaults to dry_run=True (preview mode). To execute, pass dry_run=False
+    AND confirm=True.
+    """
+    ops = _ops(device_id, ctx)
+    if dry_run:
+        result = ops.uninstall_module(module_id, dry_run=True, confirm=False)
+        return _to_output(_as_preview(result), ModuleUninstallOutput)
+    if not confirm:
+        return _refuse_confirm(ModuleUninstallOutput, "WARN")
+    result = ops.uninstall_module(module_id, dry_run=False, confirm=True)
+    return _to_output(
+        result,
+        ModuleUninstallOutput,
+        data={
+            "success": result.success,
+            "module_id": module_id,
+        },
+    )
+
+
+@mcp.tool()
+def enable_module(
+    ctx: Context,
+    device_id: str,
+    module_id: str,
+    dry_run: bool = True,
+    confirm: bool = False,
+) -> ModuleStateOutput:
+    """Enable a previously disabled root module. WARN operation.
+
+    Defaults to dry_run=True (preview mode). To execute, pass dry_run=False
+    AND confirm=True.
+    """
+    ops = _ops(device_id, ctx)
+    if dry_run:
+        result = ops.enable_module(module_id, dry_run=True, confirm=False)
+        return _to_output(_as_preview(result), ModuleStateOutput)
+    if not confirm:
+        return _refuse_confirm(ModuleStateOutput, "WARN")
+    result = ops.enable_module(module_id, dry_run=False, confirm=True)
+    return _to_output(
+        result,
+        ModuleStateOutput,
+        data={
+            "success": result.success,
+            "module_id": module_id,
+            "current_state": "enabled",
+        },
+    )
+
+
+@mcp.tool()
+def disable_module(
+    ctx: Context,
+    device_id: str,
+    module_id: str,
+    dry_run: bool = True,
+    confirm: bool = False,
+) -> ModuleStateOutput:
+    """Disable a root module. WARN operation.
+
+    Defaults to dry_run=True (preview mode). To execute, pass dry_run=False
+    AND confirm=True.
+    """
+    ops = _ops(device_id, ctx)
+    if dry_run:
+        result = ops.disable_module(module_id, dry_run=True, confirm=False)
+        return _to_output(_as_preview(result), ModuleStateOutput)
+    if not confirm:
+        return _refuse_confirm(ModuleStateOutput, "WARN")
+    result = ops.disable_module(module_id, dry_run=False, confirm=True)
+    return _to_output(
+        result,
+        ModuleStateOutput,
+        data={
+            "success": result.success,
+            "module_id": module_id,
+            "current_state": "disabled",
+        },
+    )
+
+
+@mcp.tool()
+def run_module_action(
+    ctx: Context,
+    device_id: str,
+    module_id: str,
+    dry_run: bool = True,
+    confirm: bool = False,
+) -> ModuleActionOutput:
+    """Run a root module's action.sh script. WARN operation.
+
+    Defaults to dry_run=True (preview mode). To execute, pass dry_run=False
+    AND confirm=True.
+    """
+    ops = _ops(device_id, ctx)
+    if dry_run:
+        result = ops.run_module_action(module_id, dry_run=True, confirm=False)
+        return _to_output(_as_preview(result), ModuleActionOutput)
+    if not confirm:
+        return _refuse_confirm(ModuleActionOutput, "WARN")
+    result = ops.run_module_action(module_id, dry_run=False, confirm=True)
+    return _to_output(
+        result,
+        ModuleActionOutput,
+        data={
+            "success": result.success,
+            "module_id": module_id,
+        },
+    )
 
 
 # ---------------------------------------------------------------------------

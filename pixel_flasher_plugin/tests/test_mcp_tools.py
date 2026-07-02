@@ -3,7 +3,7 @@
 Pins the contract that AI agents see when they connect to the PixelFlasher
 MCP server:
 
-  * Exactly 28 tools registered (every device operation the agent can call).
+  * Exactly 34 tools registered (every device operation the agent can call).
   * Exactly 7 resources registered (every JSON / doc the agent can read).
   * The 5 CRITICAL tools (flash_partition, erase_partition, flash_boot_image,
     unlock_bootloader, lock_bootloader) MUST accept ``dry_run`` -- this is
@@ -22,11 +22,11 @@ import pytest
 # ---------------------------------------------------------------------------
 # Tool count
 # ---------------------------------------------------------------------------
-EXPECTED_TOOL_COUNT = 28
+EXPECTED_TOOL_COUNT = 34
 
 
-def test_exactly_28_tools_registered(mcp_server_module) -> None:
-    """The MCP server MUST register exactly 28 tools."""
+def test_exactly_34_tools_registered(mcp_server_module) -> None:
+    """The MCP server MUST register exactly 34 tools."""
     mcp = mcp_server_module.mcp
     tools = mcp._tool_manager._tools
     assert len(tools) == EXPECTED_TOOL_COUNT, (

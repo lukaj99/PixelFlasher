@@ -26,6 +26,43 @@ class CommandValidator:
             r"^adb\s+-s\s+\S+\s+shell\s+su\s+-c\s+"
             r"\"cp\s+\S+\s+\S+\s+&&\s+chmod\s+\d+\s+\S+\"$"
         ),
+        # SOTA module install (Magisk / KernelSU / APatch variants)
+        re.compile(
+            r"^adb\s+-s\s+\S+\s+shell\s+su\s+-c\s+"
+            r"'(ksud|apd)\s+module\s+install\s+/sdcard/Download/[a-zA-Z0-9_.-]+'$"
+        ),
+        re.compile(
+            r"^adb\s+-s\s+\S+\s+shell\s+su\s+-c\s+"
+            r"'magisk\s+--install-module\s+/sdcard/Download/[a-zA-Z0-9_.-]+'$"
+        ),
+        # SOTA module uninstall (KSU/APD CLI) and Magisk "remove" marker
+        re.compile(
+            r"^adb\s+-s\s+\S+\s+shell\s+su\s+-c\s+"
+            r"'(ksud|apd)\s+module\s+uninstall\s+[a-zA-Z0-9_.-]+'$"
+        ),
+        re.compile(
+            r"^adb\s+-s\s+\S+\s+shell\s+su\s+-c\s+"
+            r"'touch\s+/data/adb/modules/[a-zA-Z0-9_.-]+/remove'$"
+        ),
+        # SOTA module enable/disable
+        re.compile(
+            r"^adb\s+-s\s+\S+\s+shell\s+su\s+-c\s+"
+            r"'rm\s+-f\s+/data/adb/modules/[a-zA-Z0-9_.-]+/disable'$"
+        ),
+        re.compile(
+            r"^adb\s+-s\s+\S+\s+shell\s+su\s+-c\s+"
+            r"'touch\s+/data/adb/modules/[a-zA-Z0-9_.-]+/disable'$"
+        ),
+        # SOTA module action.sh execution
+        re.compile(
+            r"^adb\s+-s\s+\S+\s+shell\s+su\s+-c\s+"
+            r"'busybox\s+sh\s+-o\s+standalone\s+/data/adb/modules/[a-zA-Z0-9_.-]+/action\.sh'$"
+        ),
+        # SOTA module listing for-loop used by Magisk/KernelSU/APatch module enumeration.
+        re.compile(
+            r"^adb\s+-s\s+\S+\s+shell\s+su\s+-c\s+"
+            r"'for\s+FILE\s+in\s+/data/adb/modules/\*;\s+do\s+if\s+test\s+-d\s+\"\$FILE\";\s+then\s+echo\s+\$FILE;\s+if\s+test\s+-f\s+\"\$FILE/remove\";\s+then\s+echo\s+\"state=remove\";\s+elif\s+test\s+-f\s+\"\$FILE/disable\";\s+then\s+echo\s+\"state=disabled\";\s+else\s+echo\s+\"state=enabled\";\s+fi;\s+if\s+test\s+-f\s+\"\$FILE/action\.sh\";\s+then\s+echo\s+\"hasAction=True\";\s+else\s+echo\s+\"hasAction=False\";\s+fi;\s+cat\s+\"\$FILE/module\.prop\";\s+echo;\s+echo\s+-----pf;\s+fi;\s+done'$"
+        ),
     ]
 
     ALLOWED_FASTBOOT_COMMANDS = [
