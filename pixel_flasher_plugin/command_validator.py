@@ -18,6 +18,8 @@ class CommandValidator:
         re.compile(r"^adb\s+-s\s+\S+\s+shell\s+pm\s+(grant|revoke)\s+\S+\s+\S+$"),
         re.compile(r"^adb\s+-s\s+\S+\s+shell\s+dumpsys(\s+\S+)*$"),
         re.compile(r"^adb\s+-s\s+\S+\s+shell\s+logcat(\s+\S+)*$"),
+        re.compile(r"^adb\s+-s\s+\S+\s+shell\s+su\s+-c\s+\"blockdev\s+--getsize64\s+\S+\"$"),
+        re.compile(r"^adb\s+-s\s+\S+\s+shell\s+su\s+-c\s+\"dd\s+if=\S+\s+bs=1M\s+2>/dev/null\"\s*>\s*\S+$"),
         re.compile(r"^adb\s+-s\s+\S+\s+shell\s+(uname|ls|cat|stat)(\s+\S+)*$"),
         re.compile(r"^adb\s+-s\s+\S+\s+(install|uninstall|push|pull|reboot|wait-for-\S+|get-state)(\s+\S+)*$"),
         # Host-side redirect used by read_partition; partition is sanitized before

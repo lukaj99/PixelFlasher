@@ -251,3 +251,41 @@ def test_erase_partition_is_not_a_device_ops_method() -> None:
         "DeviceOps.wipe_partition is missing -- the MCP erase_partition "
         "tool depends on it."
     )
+
+
+def test_read_partition_size_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Partitions larger than ``max_bytes`` are rejected before any read."""
+    ops, _ = _make_ops_with_mocks(monkeypatch, "/tmp/fake.img")
+
+    def _fake_run(cmd: str, timeout: int | None = None):
+        mock = MagicMock()
+        if "blockdev" in cmd:
+            # Root path unavailable in this scenario; exercise the fallback.
+            mock.returncode = 1
+            mock.stdout = ""
+            mock.stderr = "su: not found"
+        elif "ls -l" in cmd:
+            mock.returncode = 0
+            mock.stdout = (
+                "lrwxrwxrwx 1 root root 21 1970-01-01 00:00 "
+                "/dev/block/bootdevice/by-name/boot -> /dev/block/sda37"
+            )
+        elif "/proc/partitions" in cmd:
+            mock.returncode = 0
+            mock.stdout = (
+                "major minor  #blocks  name\n"
+                " 259        0    4194304 sda37\n"
+            )
+        else:
+            mock.returncode = 0
+            mock.stdout = ""
+            mock.stderr = ""
+        return mock
+
+    ops._run_shell_safe = MagicMock(side_effect=_fake_run)  # type: ignore[method-assign]
+
+    result = ops.read_partition("boot", confirm=True)
+
+    assert result.success is False
+    assert "exceeds" in (result.error or "").lower()
+    assert "4294967296" in (result.error or "")

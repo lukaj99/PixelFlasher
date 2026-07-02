@@ -614,7 +614,12 @@ class DeviceOps:
             self._log("install_apk", None, False)
             return self._tool_error("install_apk", exc)
 
-    def read_partition(self, partition: str, confirm: bool = False) -> ToolResult:
+    def read_partition(
+        self,
+        partition: str,
+        confirm: bool = False,
+        max_bytes: int = 256 * 1024 * 1024,
+    ) -> ToolResult:
         """Dump a partition to a local temporary file (non-destructive)."""
         if not re.match(r"^[A-Za-z0-9_]+$", partition):
             return ToolResult(
@@ -628,11 +633,85 @@ class DeviceOps:
             delete=False,
         ).name
 
+        def _size_via_blockdev(block_path: str) -> int | None:
+            subcommand = (
+                f"shell su -c \"blockdev --getsize64 {self._q(block_path)}\""
+            )
+            command = self._adb_cmd(subcommand)
+            blocked = self._evaluate(command, RiskTier.INFO, confirm)
+            if blocked:
+                return None
+            exec_cmd = self._exec_adb_cmd(subcommand)
+            res = self._run_shell_safe(exec_cmd, timeout=30)
+            if res.returncode != 0:
+                return None
+            try:
+                return int(res.stdout.strip())
+            except Exception:
+                return None
+
+        def _device_name_from_ls(block_path: str) -> str | None:
+            subcommand = f"shell ls -l {self._q(block_path)}"
+            command = self._adb_cmd(subcommand)
+            blocked = self._evaluate(command, RiskTier.INFO, confirm)
+            if blocked:
+                return None
+            exec_cmd = self._exec_adb_cmd(subcommand)
+            res = self._run_shell_safe(exec_cmd, timeout=30)
+            if res.returncode != 0:
+                return None
+            line = res.stdout.strip()
+            if " -> " in line:
+                target = line.split(" -> ", 1)[1].strip()
+                target = target.lstrip("./")
+                return os.path.basename(target)
+            return os.path.basename(block_path)
+
+        def _size_via_proc_partitions(device_name: str) -> int | None:
+            subcommand = "shell cat /proc/partitions"
+            command = self._adb_cmd(subcommand)
+            blocked = self._evaluate(command, RiskTier.INFO, confirm)
+            if blocked:
+                return None
+            exec_cmd = self._exec_adb_cmd(subcommand)
+            res = self._run_shell_safe(exec_cmd, timeout=30)
+            if res.returncode != 0:
+                return None
+            for line in res.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 4 and parts[-1] == device_name:
+                    try:
+                        return int(parts[2]) * 1024
+                    except Exception:
+                        return None
+            return None
+
+        def _partition_size(block_path: str) -> int | None:
+            size = _size_via_blockdev(block_path)
+            if size is not None:
+                return size
+            device_name = _device_name_from_ls(block_path)
+            if device_name is None:
+                return None
+            return _size_via_proc_partitions(device_name)
+
         def _try_read(block_path: str) -> subprocess.CompletedProcess[str] | None:
-            # ``cat`` is in the ADB shell whitelist; host-side redirect writes
-            # the binary stream to the local temp file.
-            subcommand = f"shell cat {self._q(block_path)}"
             redirect = f" > {self._q(local_tmp)}"
+            # Try ``dd`` under ``su`` first; it streams block reads reliably
+            # for large partitions when root is available.
+            subcommand = (
+                f"shell su -c \"dd if={self._q(block_path)} bs=1M 2>/dev/null\""
+            )
+            command = self._adb_cmd(subcommand) + redirect
+            blocked = self._evaluate(command, RiskTier.INFO, confirm)
+            if blocked:
+                return None
+            exec_cmd = self._exec_adb_cmd(subcommand) + redirect
+            res = self._run_shell_safe(exec_cmd, timeout=300)
+            if res.returncode == 0 and os.path.getsize(local_tmp) > 0:
+                return res
+            # Fall back to ``cat`` when root is unavailable or ``dd`` fails.
+            subcommand = f"shell cat {self._q(block_path)}"
             command = self._adb_cmd(subcommand) + redirect
             blocked = self._evaluate(command, RiskTier.INFO, confirm)
             if blocked:
@@ -641,26 +720,40 @@ class DeviceOps:
             return self._run_shell_safe(exec_cmd, timeout=300)
 
         try:
-            res = _try_read(f"/dev/block/bootdevice/by-name/{partition}")
-            if res is None:
-                return ToolResult(
-                    success=False,
-                    error="read_partition blocked by safety gateway",
-                )
-            if res.returncode != 0 or os.path.getsize(local_tmp) == 0:
-                res = _try_read(f"/dev/block/by-name/{partition}")
+            last_error = f"Could not read partition {partition!r}"
+            for block_path in (
+                f"/dev/block/bootdevice/by-name/{partition}",
+                f"/dev/block/by-name/{partition}",
+            ):
+                size = _partition_size(block_path)
+                if size is None:
+                    last_error = (
+                        f"Could not determine size of partition {partition!r} "
+                        f"at {block_path}"
+                    )
+                    continue
+                if size > max_bytes:
+                    return ToolResult(
+                        success=False,
+                        error=(
+                            f"Partition {partition!r} is {size} bytes, "
+                            f"which exceeds the maximum allowed {max_bytes} bytes"
+                        ),
+                    )
+                res = _try_read(block_path)
                 if res is None:
                     return ToolResult(
                         success=False,
                         error="read_partition blocked by safety gateway",
                     )
-
-            success = res.returncode == 0 and os.path.getsize(local_tmp) > 0
-            if not success:
-                return ToolResult(
-                    success=False,
-                    error=f"Could not read partition (exit {res.returncode}): {res.stderr}",
+                if res.returncode == 0 and os.path.getsize(local_tmp) > 0:
+                    break
+                last_error = (
+                    f"Could not read partition {partition!r} "
+                    f"(exit {res.returncode}): {res.stderr}"
                 )
+            else:
+                return ToolResult(success=False, error=last_error)
 
             sha = hashlib.sha256()
             with open(local_tmp, "rb") as f:
