@@ -26,6 +26,11 @@ class CommandValidator:
             r"^adb\s+-s\s+\S+\s+shell\s+su\s+-c\s+"
             r"\"cp\s+\S+\s+\S+\s+&&\s+chmod\s+\d+\s+\S+\"$"
         ),
+        # Keybox update: same cp+chmod-under-su pattern, single-quoted canonical form.
+        re.compile(
+            r"^adb\s+-s\s+\S+\s+shell\s+su\s+-c\s+"
+            r"'cp\s+\S+\s+\S+\s+&&\s+chmod\s+\d+\s+\S+'$"
+        ),
         # SOTA module install (Magisk / KernelSU / APatch variants)
         re.compile(
             r"^adb\s+-s\s+\S+\s+shell\s+su\s+-c\s+"

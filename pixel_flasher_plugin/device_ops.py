@@ -16,11 +16,13 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import xml.etree.ElementTree as ET
 import zipfile
 from typing import Any, ClassVar
 
 from pixel_flasher_plugin import command_validator, telemetry
 from pixel_flasher_plugin.headless_runtime import bootstrap, get_device
+from pixel_flasher_plugin.headless_runtime import runtime as _runtime
 from pixel_flasher_plugin.headless_runtime import run_shell as _run_shell
 from pixel_flasher_plugin.result_types import RiskTier, ToolResult
 from pixel_flasher_plugin.safety_engine import Decision, SafetyGateway
@@ -1436,6 +1438,297 @@ class DeviceOps:
                 os.remove(local_tmp)
             except Exception:
                 pass
+
+    # ------------------------------------------------------------------
+    # Keybox / hardware attestation management
+    # ------------------------------------------------------------------
+    KEYBOX_PATH: ClassVar[str] = "/data/adb/tricky_store/keybox.xml"
+
+    def _parse_keybox_cert(self, keybox_path: str) -> tuple[str | None, str | None]:
+        """Extract the first certificate serial number and expiry from a keybox.xml.
+
+        The keybox XML contains one or more ``Certificate`` elements (some
+        keybox variants use ``DeviceCertificate``).  The first parseable PEM
+        certificate is used to obtain the serial and not-after date.
+        """
+        try:
+            tree = ET.parse(keybox_path)
+            root = tree.getroot()
+        except Exception:
+            return None, None
+
+        for elem in root.iter():
+            if elem.tag not in ("Certificate", "DeviceCertificate"):
+                continue
+            text = (elem.text or "").strip()
+            if not text:
+                continue
+            try:
+                from cryptography import x509
+
+                cert = x509.load_pem_x509_certificate(text.encode())
+                serial = f"{cert.serial_number:x}"
+                expiry = None
+                if cert.not_valid_after_utc:
+                    expiry = cert.not_valid_after_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+                return serial, expiry
+            except Exception:
+                continue
+        return None, None
+
+    def _check_kb_result(self, result: Any) -> tuple[bool, str]:
+        """Normalize the output of ``runtime.check_kb`` into (revoked, raw_text).
+
+        ``check_kb`` returns either a list of status strings or a single string.
+        """
+        if isinstance(result, list):
+            raw = " ".join(str(item) for item in result)
+            revoked = "revoked" in raw.lower()
+        else:
+            raw = str(result)
+            revoked = "revoked" in raw.lower()
+        return revoked, raw
+
+    def get_keybox_status(self, device_id: str | None = None) -> ToolResult:
+        """Check the device's keybox.xml for existence and revocation status.
+
+        Pulls the keybox to a local temp file, runs ``runtime.check_kb`` against
+        Google's certificate revocation list, and parses the XML for the leaf
+        certificate serial number and expiry.
+        """
+        keybox_xml = self.KEYBOX_PATH
+        local_tmp: str | None = None
+        try:
+            dev = self._lazy_device()
+            res, _ = dev.check_file(keybox_xml, with_su=True, verbose=False)
+            if res != 1:
+                return ToolResult(
+                    success=True,
+                    data={
+                        "exists": False,
+                        "revoked": None,
+                        "revoked_reason": None,
+                        "certificate_serial": None,
+                        "expiry_date": None,
+                        "raw_check_kb_result": "",
+                    },
+                )
+
+            local_tmp = tempfile.NamedTemporaryFile(
+                prefix="keybox_",
+                suffix=".xml",
+                delete=False,
+            ).name
+
+            rc = dev.pull_file(keybox_xml, local_tmp, with_su=True, quiet=False)
+            if rc != 0:
+                return ToolResult(
+                    success=False,
+                    error=f"Failed to pull keybox.xml from device (rc={rc})",
+                )
+
+            check_result = _runtime.check_kb(local_tmp)
+            revoked, raw = self._check_kb_result(check_result)
+            revoked_reason = raw if revoked else None
+            serial, expiry = self._parse_keybox_cert(local_tmp)
+
+            self._log("get_keybox_status", None, True)
+            return ToolResult(
+                success=True,
+                data={
+                    "exists": True,
+                    "revoked": revoked,
+                    "revoked_reason": revoked_reason,
+                    "certificate_serial": serial,
+                    "expiry_date": expiry,
+                    "raw_check_kb_result": raw,
+                },
+            )
+        except Exception as exc:
+            self._log("get_keybox_status", None, False)
+            return self._tool_error("get_keybox_status", exc)
+        finally:
+            if local_tmp and os.path.exists(local_tmp):
+                try:
+                    os.remove(local_tmp)
+                except Exception:
+                    pass
+
+    def update_keybox(
+        self,
+        source: str | None = None,
+        content: str | None = None,
+        dry_run: bool = True,
+        confirm: bool = False,
+        device_id: str | None = None,
+    ) -> ToolResult:
+        """Validate and push a new keybox.xml to the device.
+
+        The supplied keybox is validated locally as XML and checked against
+        Google's certificate revocation list before any device interaction.
+        Revoked keyboxes are refused.  The file is pushed to a temporary
+        location and then moved into place under root.
+        """
+        if source:
+            source_path = os.path.abspath(os.path.expanduser(source))
+            if not os.path.isfile(source_path):
+                return ToolResult(
+                    success=False,
+                    error=f"Keybox file not found: {source_path}",
+                )
+            try:
+                with open(source_path, "r", encoding="utf-8") as f:
+                    xml_content = f.read()
+            except Exception as exc:
+                return ToolResult(
+                    success=False,
+                    error=f"Failed to read keybox file: {exc}",
+                )
+        elif content:
+            xml_content = content
+        else:
+            return ToolResult(
+                success=False,
+                error="Either source or content must be provided",
+            )
+
+        # Validate XML structure.
+        try:
+            root = ET.fromstring(xml_content)
+        except ET.ParseError as exc:
+            return ToolResult(success=False, error=f"Invalid XML: {exc}")
+
+        if root.tag != "AndroidAttestation":
+            return ToolResult(
+                success=False,
+                error=f"Invalid keybox root element: {root.tag}",
+            )
+
+        has_num_certs = any(elem.tag == "NumberOfCertificates" for elem in root.iter())
+        has_cert = any(
+            elem.tag in ("Certificate", "DeviceCertificate") for elem in root.iter()
+        )
+        if not has_num_certs or not has_cert:
+            return ToolResult(
+                success=False,
+                error=(
+                    "Invalid keybox structure: missing NumberOfCertificates "
+                    "or Certificate/DeviceCertificate elements"
+                ),
+            )
+
+        local_tmp: str | None = None
+        try:
+            fd, local_tmp = tempfile.mkstemp(prefix="keybox_", suffix=".xml")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(xml_content)
+
+            check_result = _runtime.check_kb(local_tmp)
+            revoked, raw = self._check_kb_result(check_result)
+            if revoked:
+                return ToolResult(
+                    success=False,
+                    error=f"Refusing to push revoked keybox: {raw}",
+                    data={
+                        "pushed": False,
+                        "remote_path": self.KEYBOX_PATH,
+                        "revoked": True,
+                        "revoked_reason": raw,
+                    },
+                )
+
+            if dry_run:
+                return ToolResult(
+                    success=True,
+                    dry_run=True,
+                    data={
+                        "pushed": False,
+                        "remote_path": self.KEYBOX_PATH,
+                        "revoked": False,
+                        "revoked_reason": None,
+                    },
+                    warnings=["Dry run - no changes made"],
+                )
+
+            if not confirm:
+                return ToolResult(
+                    success=False,
+                    error="WARN operation requires confirm=True when dry_run=False",
+                    data={"requires_confirmation": True},
+                )
+
+            remote_tmp = "/data/local/tmp/keybox.xml"
+            final_path = self.KEYBOX_PATH
+
+            dev = self._lazy_device()
+
+            # Push the validated keybox to a temporary device path.
+            push_cmd = self._adb_cmd(f"push {self._q(local_tmp)} {self._q(remote_tmp)}")
+            blocked = self._evaluate(push_cmd, RiskTier.WARN, confirm)
+            if blocked:
+                self._log("update_keybox", push_cmd, False)
+                return blocked
+
+            preflight = self._run_preflight(RiskTier.WARN, expected_mode="adb")
+            if preflight:
+                self._log("update_keybox", push_cmd, False)
+                return preflight
+
+            rc = dev.push_file(local_tmp, remote_tmp)
+            if rc != 0:
+                self._log("update_keybox", push_cmd, False)
+                return ToolResult(
+                    success=False,
+                    error=f"push_file returned {rc}",
+                    command=push_cmd,
+                )
+
+            # Move into place as root and fix permissions.
+            su_cmd = self._adb_cmd(
+                f'shell su -c "cp {self._q(remote_tmp)} {self._q(final_path)} '
+                f'&& chmod 644 {self._q(final_path)}"'
+            )
+            blocked = self._evaluate(su_cmd, RiskTier.WARN, confirm)
+            if blocked:
+                self._log("update_keybox", su_cmd, False)
+                return blocked
+
+            exec_cmd = self._exec_adb_cmd(
+                f'shell su -c "cp {self._q(remote_tmp)} {self._q(final_path)} '
+                f'&& chmod 644 {self._q(final_path)}"'
+            )
+            res = self._run_shell_safe(exec_cmd, timeout=60)
+            if res.returncode != 0:
+                self._log("update_keybox", su_cmd, False)
+                return ToolResult(
+                    success=False,
+                    error=(
+                        f"su copy failed (exit {res.returncode}): {res.stderr}; "
+                        "root is required to install the keybox"
+                    ),
+                    command=su_cmd,
+                )
+
+            self._log("update_keybox", su_cmd, True)
+            return ToolResult(
+                success=True,
+                data={
+                    "pushed": True,
+                    "remote_path": final_path,
+                    "revoked": False,
+                    "revoked_reason": None,
+                },
+                command=su_cmd,
+            )
+        except Exception as exc:
+            self._log("update_keybox", None, False)
+            return self._tool_error("update_keybox", exc)
+        finally:
+            if local_tmp and os.path.exists(local_tmp):
+                try:
+                    os.remove(local_tmp)
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------
     # SOTA / root module operations

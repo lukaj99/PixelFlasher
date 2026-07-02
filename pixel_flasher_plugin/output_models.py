@@ -1,4 +1,4 @@
-"""Pydantic BaseModel output schemas for the 34-tool MCP catalog."""
+"""Pydantic BaseModel output schemas for the 36-tool MCP catalog."""
 from __future__ import annotations
 
 from pydantic import BaseModel, Field
@@ -163,6 +163,25 @@ class PifUpdateOutput(BaseModel):
     success: bool = Field(description="Whether the PIF update succeeded")
     previous_hash: str | None = Field(default=None, description="SHA256 of previous pif.json")
     new_hash: str | None = Field(default=None, description="SHA256 of new pif.json")
+    dry_run: bool = Field(default=True, description="Whether this was a dry run")
+    warnings: list[str] = Field(default_factory=list, description="Non-fatal warnings")
+
+
+class KeyboxStatusOutput(BaseModel):
+    exists: bool = Field(description="Whether keybox.xml exists on the device")
+    revoked: bool | None = Field(default=None, description="Whether the keybox is revoked")
+    revoked_reason: str | None = Field(default=None, description="Revocation reason if revoked")
+    certificate_serial: str | None = Field(default=None, description="Leaf certificate serial number")
+    expiry_date: str | None = Field(default=None, description="Certificate expiry date")
+    raw_check_kb_result: str = Field(default="", description="Raw check_kb output")
+
+
+class KeyboxUpdateOutput(BaseModel):
+    success: bool = Field(description="Whether the update succeeded")
+    pushed: bool | None = Field(default=None, description="Whether the keybox was pushed")
+    remote_path: str | None = Field(default=None, description="Final path on device")
+    revoked: bool | None = Field(default=None, description="Whether the keybox was revoked")
+    revoked_reason: str | None = Field(default=None, description="Revocation reason if revoked")
     dry_run: bool = Field(default=True, description="Whether this was a dry run")
     warnings: list[str] = Field(default_factory=list, description="Non-fatal warnings")
 

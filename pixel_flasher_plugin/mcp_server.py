@@ -1,6 +1,6 @@
 """PixelFlasher MCP server adapter.
 
-This module exposes the PixelFlasher device-operation facade as 34 MCP tools
+This module exposes the PixelFlasher device-operation facade as 36 MCP tools
 that AI agents can call.  It bootstraps the headless runtime once at startup
 and shares the same SafetyGateway across all tool invocations.
 """
@@ -34,6 +34,8 @@ from pixel_flasher_plugin.output_models import (
     DeviceInfoOutput,
     DeviceListOutput,
     FactoryFlashOutput,
+    KeyboxStatusOutput,
+    KeyboxUpdateOutput,
     LogcatOutput,
     ModuleActionOutput,
     ModuleInstallOutput,
@@ -716,6 +718,47 @@ def check_play_integrity(
     """
     result = _ops(device_id, ctx).check_play_integrity()
     return _to_output(result, PlayIntegrityOutput)
+
+
+# ---------------------------------------------------------------------------
+# Category 6.5 — Keybox / Hardware Attestation
+# ---------------------------------------------------------------------------
+@mcp.tool()
+def get_keybox_status(ctx: Context, device_id: str) -> KeyboxStatusOutput:
+    """Read the device's keybox.xml status. INFO operation.
+
+    Reports whether /data/adb/tricky_store/keybox.xml exists, whether its
+    certificates are on Google's revocation list, and the leaf certificate
+    serial/expiry when available.
+    """
+    result = _ops(device_id, ctx).get_keybox_status()
+    return _to_output(result, KeyboxStatusOutput)
+
+
+@mcp.tool()
+def update_keybox(
+    ctx: Context,
+    device_id: str,
+    source: str | None = None,
+    content: str | None = None,
+    dry_run: bool = True,
+    confirm: bool = False,
+) -> KeyboxUpdateOutput:
+    """Push a new keybox.xml to the device. WARN operation.
+
+    The supplied keybox is validated locally as XML, checked against Google's
+    certificate revocation list, and only pushed if it is not revoked. Root
+    access is required for the final copy/chmod step. Pass confirm=True to
+    execute.
+    """
+    ops = _ops(device_id, ctx)
+    if dry_run:
+        result = ops.update_keybox(source=source, content=content, dry_run=True, confirm=False)
+        return _to_output(_as_preview(result), KeyboxUpdateOutput)
+    if not confirm:
+        return _refuse_confirm(KeyboxUpdateOutput, "WARN")
+    result = ops.update_keybox(source=source, content=content, dry_run=False, confirm=True)
+    return _to_output(result, KeyboxUpdateOutput)
 
 
 # ---------------------------------------------------------------------------
