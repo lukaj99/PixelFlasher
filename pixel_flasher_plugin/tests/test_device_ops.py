@@ -14,6 +14,8 @@ so no real adb/fastboot/device work happens.
 """
 from __future__ import annotations
 
+import contextlib
+import subprocess
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -708,3 +710,120 @@ def test_avb_verify_image_reports_signature_failure(monkeypatch: pytest.MonkeyPa
     data = result.data or {}
     assert data["valid"] is False
     assert "Signature check failed" in (data.get("error") or "")
+
+
+# ---------------------------------------------------------------------------
+# list_devices parsing -- whitespace-tolerant adb/fastboot output
+# ---------------------------------------------------------------------------
+@contextlib.contextmanager
+def _make_list_devices_mocks(adb_stdout: str, fastboot_stdout: str = ""):
+    """Patch _ensure_bootstrap and _run_shell used by list_devices."""
+    rt = MagicMock()
+    rt.get_adb.return_value = "adb"
+    rt.get_fastboot.return_value = "fastboot"
+
+    def _fake_run(cmd: str, timeout: int | None = None):
+        if "adb" in cmd and "devices -l" in cmd:
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=adb_stdout, stderr="")
+        elif "fastboot" in cmd and "devices" in cmd:
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=fastboot_stdout, stderr="")
+        else:
+            return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="unexpected command")
+
+    with patch("pixel_flasher_plugin.device_ops._ensure_bootstrap", return_value=(rt, None)), \
+         patch("pixel_flasher_plugin.device_ops._run_shell", side_effect=_fake_run):
+        yield
+
+
+def test_list_devices_parses_real_adb_space_separated_output() -> None:
+    """The exact real-world ``adb devices -l`` output uses spaces, not tabs."""
+    adb_stdout = (
+        "List of devices attached\n"
+        "100.123.230.67:5555          device product:bk1 model:Pixel_10_Pro_XL device:mustang transport_id:8\n"
+        "\n"
+    )
+    with _make_list_devices_mocks(adb_stdout):
+        result = DeviceOps.list_devices()
+
+    assert result.success is True
+    assert result.data is not None
+    assert result.data["count"] == 1
+    devices = result.data["devices"]
+    assert len(devices) == 1
+    dev = devices[0]
+    assert dev["id"] == "100.123.230.67:5555"
+    assert dev["state"] == "device"
+    assert dev["mode"] == "adb"
+    assert dev["product"] == "bk1"
+    assert dev["model"] == "Pixel_10_Pro_XL"
+    assert dev["device"] == "mustang"
+    assert dev["transport_id"] == "8"
+
+
+def test_list_devices_parses_fastboot_space_separated_output() -> None:
+    """``fastboot devices`` is also space-separated in practice."""
+    fastboot_stdout = "ABC123DEF          fastboot\n"
+    with _make_list_devices_mocks("", fastboot_stdout):
+        result = DeviceOps.list_devices()
+
+    assert result.success is True
+    assert result.data is not None
+    assert result.data["count"] == 1
+    dev = result.data["devices"][0]
+    assert dev["id"] == "ABC123DEF"
+    assert dev["state"] == "fastboot"
+    assert dev["mode"] == "fastboot"
+
+
+def test_list_devices_parses_mixed_adb_states() -> None:
+    """Unauthorized/offline/recovery states are preserved with correct mode."""
+    adb_stdout = (
+        "List of devices attached\n"
+        "serial1          device product:p1 model:m1 device:d1 transport_id:1\n"
+        "serial2          unauthorized\n"
+        "serial3          offline\n"
+        "serial4          recovery product:p2 model:m2 device:d2 transport_id:2\n"
+    )
+    with _make_list_devices_mocks(adb_stdout):
+        result = DeviceOps.list_devices()
+
+    assert result.success is True
+    assert result.data["count"] == 4
+    by_id = {d["id"]: d for d in result.data["devices"]}
+    assert by_id["serial1"]["mode"] == "adb"
+    assert by_id["serial2"]["state"] == "unauthorized"
+    assert by_id["serial2"]["mode"] == "unauthorized"
+    assert by_id["serial3"]["state"] == "offline"
+    assert by_id["serial4"]["state"] == "recovery"
+    assert by_id["serial4"]["device"] == "d2"
+
+
+def test_list_devices_still_handles_tab_separated_legacy_output() -> None:
+    """Older/tab-separated adb output must keep working after the fix."""
+    adb_stdout = "List of devices attached\nserial1\tdevice\tproduct:p1 model:m1 device:d1 transport_id:1\n"
+    with _make_list_devices_mocks(adb_stdout):
+        result = DeviceOps.list_devices()
+
+    assert result.success is True
+    assert result.data["count"] == 1
+    dev = result.data["devices"][0]
+    assert dev["id"] == "serial1"
+    assert dev["mode"] == "adb"
+    assert dev["product"] == "p1"
+    assert dev["device"] == "d1"
+
+
+def test_list_devices_skips_malformed_and_empty_lines() -> None:
+    """Lines with fewer than two tokens must not crash or create entries."""
+    adb_stdout = (
+        "List of devices attached\n"
+        "\n"
+        "garbage\n"
+        "serial1          device product:p1 model:m1 device:d1 transport_id:1\n"
+    )
+    with _make_list_devices_mocks(adb_stdout):
+        result = DeviceOps.list_devices()
+
+    assert result.success is True
+    assert result.data["count"] == 1
+    assert result.data["devices"][0]["id"] == "serial1"

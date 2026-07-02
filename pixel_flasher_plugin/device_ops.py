@@ -366,13 +366,14 @@ class DeviceOps:
             res = _run_shell(f'"{adb}" devices -l', timeout=30)
             if res and isinstance(res, subprocess.CompletedProcess) and res.returncode == 0:
                 for line in res.stdout.splitlines():
-                    if "List of devices attached" in line or "\t" not in line:
+                    line = line.strip()
+                    if not line or "List of devices attached" in line:
                         continue
-                    parts = line.split("\t")
-                    if len(parts) < 2:
+                    tokens = line.split()
+                    if len(tokens) < 2:
                         continue
-                    d_id = parts[0].strip()
-                    state = parts[1].strip()
+                    d_id = tokens[0]
+                    state = tokens[1]
                     entry: dict[str, Any] = {
                         "id": d_id,
                         "state": state,
@@ -380,12 +381,11 @@ class DeviceOps:
                     }
                     if state == "device":
                         entry["mode"] = "adb"
-                    if len(parts) > 2:
-                        for field in parts[2].split():
-                            if ":" in field:
-                                key, value = field.split(":", 1)
-                                if key in ("product", "model", "transport_id"):
-                                    entry[key] = value
+                    for field in tokens[2:]:
+                        if ":" in field:
+                            key, value = field.split(":", 1)
+                            if key in ("product", "model", "device", "transport_id"):
+                                entry[key] = value
                     devices.append(entry)
         except Exception as exc:
             return ToolResult(success=False, error=f"adb devices failed: {exc}")
@@ -395,10 +395,10 @@ class DeviceOps:
             res = _run_shell(f'"{fastboot}" devices', timeout=30)
             if res and isinstance(res, subprocess.CompletedProcess) and res.returncode == 0:
                 for line in res.stdout.splitlines():
-                    if "\tfastboot" in line:
-                        d_id = line.split("\t")[0].strip()
+                    tokens = line.split()
+                    if len(tokens) >= 2 and tokens[1] == "fastboot":
                         devices.append({
-                            "id": d_id,
+                            "id": tokens[0],
                             "state": "fastboot",
                             "mode": "fastboot",
                         })
