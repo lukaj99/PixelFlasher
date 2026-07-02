@@ -43,9 +43,14 @@ class CommandValidator:
         "xbl_config",
         "abl",
         "aop",
+        "apdp",
+        "cmnlib",
+        "cmnlib32",
         "devcfg",
+        "dip",
         "hyp",
         "keymaster",
+        "limits",
         "qupfw",
         "tz",
         "uefisecapp",
@@ -56,6 +61,7 @@ class CommandValidator:
         "storsec",
         "spunvm",
         "modem",
+        "msadp",
     }
 
     ALLOWED_PARTITIONS = {

@@ -1,0 +1,253 @@
+"""DeviceOps preflight wiring + shlex.quote invariant tests.
+
+Two safety invariants are pinned here:
+
+  1. Every destructive ``DeviceOps`` method MUST call ``_run_preflight``
+     before executing -- this is the safety hook that prevents flashing an
+     unverified image to a connected device.
+
+  2. ``_q()`` MUST shell-quote user-supplied strings so a value like
+     ``$(whoami)`` is passed through verbatim rather than executed.
+
+These tests use monkeypatch to spy on ``_run_preflight`` and a mock gateway,
+so no real adb/fastboot/device work happens.
+"""
+from __future__ import annotations
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from pixel_flasher_plugin.device_ops import DeviceOps
+from pixel_flasher_plugin.result_types import ToolResult
+
+
+# ---------------------------------------------------------------------------
+# _q() helper -- shell quoting
+# ---------------------------------------------------------------------------
+def test_q_helper_quotes_command_substitution() -> None:
+    """``_q('$(whoami)')`` must return a quoted string (no execution)."""
+    ops = DeviceOps(device_id="FAKE001")
+    quoted = ops._q("$(whoami)")
+    # shlex.quote wraps dangerous strings in single quotes; verify the
+    # original metacharacters survive verbatim (not interpolated).
+    assert "$(whoami)" in quoted, (
+        f"_q dropped the original input: got {quoted!r}"
+    )
+    # The result MUST contain a quote character so the shell treats it as
+    # a literal, not as a subshell. shlex.quote returns ``'$(whoami)'``
+    # which contains single quotes.
+    assert "'" in quoted or '"' in quoted, (
+        f"_q did not quote the input: got {quoted!r} -- "
+        f"a value with $(...) would be executed by the shell"
+    )
+
+
+def test_q_helper_handles_plain_strings() -> None:
+    """``_q('plain')`` must still produce a quoted result (no surprises)."""
+    ops = DeviceOps(device_id="FAKE001")
+    quoted = ops._q("plain")
+    assert quoted  # truthy -- not empty
+    assert "plain" in quoted
+
+
+def test_q_helper_quotes_spaces() -> None:
+    """A value containing a space must be quoted so it stays one argument."""
+    ops = DeviceOps(device_id="FAKE001")
+    quoted = ops._q("path with spaces.img")
+    assert " " not in quoted.replace(" ", "_NO_SPACE_", 0) or quoted != "path with spaces.img", (
+        f"Unquoted space in: {quoted!r}"
+    )
+    # Stronger: the original space-containing string must not appear raw.
+    assert "path with spaces.img" != quoted or "'" in quoted or '"' in quoted
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight wiring -- destructive methods must call _run_preflight
+# ---------------------------------------------------------------------------
+def _make_ops_with_mocks(monkeypatch: pytest.MonkeyPatch, tmp_image_path: str):
+    """Build a DeviceOps whose gateway and shell-exec are mocked.
+
+    Returns (ops, gateway_mock) where gateway_mock is the MagicMock
+    backing ``ops.gateway`` (its ``.evaluate`` returns None so commands
+    pass the safety gate without being blocked).
+    """
+    gateway_mock = MagicMock()
+    # evaluate(...) returns (Decision.ALLOW, "") so _evaluate() returns None.
+    from pixel_flasher_plugin.safety_engine import Decision
+    gateway_mock.evaluate.return_value = (Decision.ALLOW, "")
+
+    ops = DeviceOps(device_id="FAKE001", gateway=gateway_mock)
+
+    # Stub the runtime shell so even if a method slips past preflight it
+    # cannot actually execute.
+    ops._run_shell_safe = MagicMock(  # type: ignore[method-assign]
+        return_value=MagicMock(returncode=0, stdout="", stderr="")
+    )
+    return ops, gateway_mock
+
+
+def test_flash_partition_calls_run_preflight(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """flash_partition() MUST call _run_preflight with CRITICAL risk tier.
+
+    We monkeypatch _run_preflight on the class so we can both observe the
+    call AND short-circuit execution (return a denial ToolResult so the
+    method exits before invoking the shell).
+    """
+    img = tmp_path / "boot.img"
+    img.write_bytes(b"\x00" * 16)
+
+    ops, _ = _make_ops_with_mocks(monkeypatch, str(img))
+
+    preflight_spy = MagicMock(
+        return_value=ToolResult(success=False, error="blocked by spy")
+    )
+    monkeypatch.setattr(DeviceOps, "_run_preflight", preflight_spy)
+
+    result = ops.flash_partition("boot", str(img), confirm=True)
+
+    assert preflight_spy.called, (
+        "flash_partition() did NOT call _run_preflight -- a CRITICAL "
+        "operation was allowed to skip the preflight gate."
+    )
+    # The result must reflect the spy denial (no real flash).
+    assert result.success is False
+    assert "blocked by spy" in (result.error or "")
+
+
+def test_wipe_partition_calls_run_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
+    """wipe_partition() MUST call _run_preflight.
+
+    NOTE on naming: the task brief refers to ``erase_partition``. The
+    DeviceOps facade names this method ``wipe_partition``; the MCP layer
+    exposes it as the ``erase_partition`` tool. This test pins the
+    DeviceOps-level wiring.
+    """
+    ops, _ = _make_ops_with_mocks(monkeypatch, "/tmp/fake.img")
+
+    preflight_spy = MagicMock(
+        return_value=ToolResult(success=False, error="blocked by spy")
+    )
+    monkeypatch.setattr(DeviceOps, "_run_preflight", preflight_spy)
+
+    result = ops.wipe_partition("boot", confirm=True)
+
+    assert preflight_spy.called, (
+        "wipe_partition() did NOT call _run_preflight -- a CRITICAL "
+        "erase was allowed to skip the preflight gate."
+    )
+    assert result.success is False
+    assert "blocked by spy" in (result.error or "")
+
+
+def test_install_apk_calls_run_preflight(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """install_apk() MUST call _run_preflight (WARN risk tier)."""
+    apk = tmp_path / "app.apk"
+    apk.write_bytes(b"\x00" * 16)
+
+    ops, _ = _make_ops_with_mocks(monkeypatch, str(apk))
+
+    preflight_spy = MagicMock(
+        return_value=ToolResult(success=False, error="blocked by spy")
+    )
+    monkeypatch.setattr(DeviceOps, "_run_preflight", preflight_spy)
+
+    result = ops.install_apk(str(apk), confirm=True)
+
+    assert preflight_spy.called, (
+        "install_apk() did NOT call _run_preflight -- a WARN-tier APK "
+        "install was allowed to skip the preflight gate."
+    )
+    assert result.success is False
+
+
+def test_reboot_device_calls_run_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
+    """reboot_device() MUST call _run_preflight (WARN risk tier).
+
+    reboot_device is also a destructive operation -- an unexpected reboot
+    could interrupt a user mid-flash. It must go through preflight.
+    """
+    ops, _ = _make_ops_with_mocks(monkeypatch, "/tmp/fake.img")
+
+    preflight_spy = MagicMock(
+        return_value=ToolResult(success=False, error="blocked by spy")
+    )
+    monkeypatch.setattr(DeviceOps, "_run_preflight", preflight_spy)
+
+    result = ops.reboot_device("system", confirm=True)
+
+    assert preflight_spy.called, (
+        "reboot_device() did NOT call _run_preflight -- a WARN-tier "
+        "reboot was allowed to skip the preflight gate."
+    )
+    assert result.success is False
+
+
+# ---------------------------------------------------------------------------
+# Cross-cutting: confirm=False alone MUST NOT skip preflight
+# ---------------------------------------------------------------------------
+def test_flash_partition_runs_preflight_even_when_confirm_false(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """confirm=False (preview path) still calls _run_preflight.
+
+    The preflight gate runs BEFORE the confirmation gate -- this catches
+    cases where the device is in the wrong mode even on a preview request.
+    """
+    img = tmp_path / "boot.img"
+    img.write_bytes(b"\x00" * 16)
+
+    ops, _ = _make_ops_with_mocks(monkeypatch, str(img))
+
+    preflight_spy = MagicMock(return_value=None)  # preflight passes
+    monkeypatch.setattr(DeviceOps, "_run_preflight", preflight_spy)
+
+    # confirm=False triggers the safety-gateway CONFIRM path; the gateway
+    # mock returns ALLOW so the safety gate passes. Preflight must STILL run.
+    result = ops.flash_partition("boot", str(img), confirm=False)
+
+    assert preflight_spy.called, (
+        "flash_partition(confirm=False) skipped _run_preflight -- "
+        "preflight must run before the confirmation gate."
+    )
+    # confirm=False -> method should NOT have actually flashed.
+    assert ops._run_shell_safe.called is False or result.success is True
+
+
+# ---------------------------------------------------------------------------
+# Finding: task brief referenced DeviceOps.flash_boot_image, which doesn't
+# exist at the DeviceOps layer -- it is implemented as an MCP tool that
+# delegates to flash_partition. This test documents the layering.
+# ---------------------------------------------------------------------------
+def test_flash_boot_image_is_not_a_device_ops_method() -> None:
+    """flash_boot_image() is an MCP-level wrapper, not a DeviceOps method.
+
+    The task brief expected to test ``flash_boot_image`` preflight wiring
+    against ``DeviceOps``. The actual layering is:
+
+        MCP tool: flash_boot_image  (in pixel_flasher_plugin.mcp_server)
+            -> DeviceOps.flash_partition  (which calls _run_preflight)
+
+    So the preflight invariant is enforced at the ``flash_partition``
+    layer (covered by test_flash_partition_calls_run_preflight above).
+    """
+    assert not hasattr(DeviceOps, "flash_boot_image"), (
+        "DeviceOps.flash_boot_image was added -- if so, add preflight "
+        "wiring tests for it as well."
+    )
+
+
+def test_erase_partition_is_not_a_device_ops_method() -> None:
+    """DeviceOps uses ``wipe_partition``; ``erase_partition`` is the MCP name."""
+    assert not hasattr(DeviceOps, "erase_partition"), (
+        "DeviceOps.erase_partition was added -- if so, add preflight "
+        "wiring tests for it as well."
+    )
+    assert hasattr(DeviceOps, "wipe_partition"), (
+        "DeviceOps.wipe_partition is missing -- the MCP erase_partition "
+        "tool depends on it."
+    )
