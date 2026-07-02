@@ -49,6 +49,13 @@ class DeviceOps:
         "sideload": "reboot_sideload",
     }
 
+    _BOOT_CLASS_PARTITIONS: ClassVar[set[str]] = {
+        "boot",
+        "init_boot",
+        "vendor_boot",
+        "dtbo",
+    }
+
     def __init__(
         self,
         device_id: str | None = None,
@@ -171,6 +178,88 @@ class DeviceOps:
                 preflight_checks=preflight,
             )
         return None
+
+    def _is_boot_class_partition(self, partition: str) -> bool:
+        """Return True if *partition* (ignoring A/B slot suffix) is boot-class."""
+        base = partition
+        if len(partition) > 2 and partition[-2] == "_" and partition[-1] in ("a", "b"):
+            base = partition[:-2]
+        return base in self._BOOT_CLASS_PARTITIONS
+
+    def _backup_partition(self, partition: str, confirm: bool) -> tuple[bool, str]:
+        """Back up *partition* to a local temp file using read_partition machinery.
+
+        Returns (True, backup_path) on success, or (False, error_message).
+        """
+        result = self.read_partition(partition, confirm=confirm)
+        if not result.success:
+            return False, result.error or "backup read_partition failed"
+        data = result.data or {}
+        backup_path = data.get("local_path")
+        if not backup_path or not os.path.isfile(backup_path):
+            return False, "backup did not produce a local file"
+        return True, backup_path
+
+    def _rollback_flash(
+        self,
+        partition: str,
+        backup_path: str,
+        confirm: bool,
+    ) -> ToolResult:
+        """Re-flash *backup_path* to *partition* via fastboot."""
+        subcommand = f"flash {self._q(partition)} {self._q(backup_path)}"
+        command = self._fastboot_cmd(subcommand)
+        blocked = self._evaluate(command, RiskTier.CRITICAL, confirm)
+        if blocked:
+            return blocked
+
+        exec_cmd = self._exec_fastboot_cmd(subcommand)
+        res = self._run_shell_safe(exec_cmd, timeout=300)
+        success = res.returncode == 0
+        self._log("rollback_flash", command, success)
+        if not success:
+            return ToolResult(
+                success=False,
+                error=f"rollback flash failed (exit {res.returncode}): {res.stderr}",
+                command=command,
+            )
+        return ToolResult(
+            success=True,
+            data={"partition": partition, "backup_path": backup_path},
+            command=command,
+        )
+
+    def _rollback_from_args(self, args: dict[str, Any]) -> None:
+        """Adapter used by SafetyGateway.perform_rollback; raises on failure."""
+        result = self._rollback_flash(
+            args["partition"],
+            args["backup_path"],
+            args["confirm"],
+        )
+        if not result.success:
+            raise RuntimeError(result.error or "rollback failed")
+
+    def _verify_fastboot_responsive(self, confirm: bool) -> tuple[bool, str]:
+        """Lightweight post-flash check: fastboot getvar product must succeed."""
+        subcommand = "getvar product"
+        command = self._fastboot_cmd(subcommand)
+        blocked = self._evaluate(command, RiskTier.INFO, confirm)
+        if blocked:
+            return False, blocked.error or "post-flash verification blocked"
+
+        exec_cmd = self._exec_fastboot_cmd(subcommand)
+        res = self._run_shell_safe(exec_cmd, timeout=30)
+        if res.returncode != 0:
+            return False, f"device unresponsive (exit {res.returncode}): {res.stderr}"
+        return True, "device responsive"
+
+    def _postcondition_device_responsive(
+        self,
+        args: dict[str, Any],
+        data: Any,
+    ) -> tuple[bool, str]:
+        """Postcondition callable for SafetyGateway.verify_postcondition."""
+        return self._verify_fastboot_responsive(args.get("confirm", False))
 
     def _run_shell_safe(
         self,
@@ -369,49 +458,150 @@ class DeviceOps:
         image_path: str,
         confirm: bool = False,
     ) -> ToolResult:
-        """Flash a partition image via fastboot."""
-        try:
-            resolved = os.path.abspath(os.path.expanduser(image_path))
-            if not os.path.isfile(resolved):
-                return ToolResult(
-                    success=False,
-                    error=f"Image file not found: {resolved}",
-                )
-            subcommand = f"flash {self._q(partition)} {self._q(resolved)}"
-            command = self._fastboot_cmd(subcommand)
-            blocked = self._evaluate(command, RiskTier.CRITICAL, confirm)
-            if blocked:
-                self._log("flash_partition", command, False)
-                return blocked
-
-            preflight = self._run_preflight(
-                RiskTier.CRITICAL,
-                expected_mode="fastboot",
-                operation="flash",
-                partition=partition,
+        """Flash a partition image via fastboot with backup + rollback for boot-class partitions."""
+        resolved = os.path.abspath(os.path.expanduser(image_path))
+        if not os.path.isfile(resolved):
+            return ToolResult(
+                success=False,
+                error=f"Image file not found: {resolved}",
             )
-            if preflight:
-                self._log("flash_partition", command, False)
-                return preflight
+
+        subcommand = f"flash {self._q(partition)} {self._q(resolved)}"
+        command = self._fastboot_cmd(subcommand)
+        blocked = self._evaluate(command, RiskTier.CRITICAL, confirm)
+        if blocked:
+            self._log("flash_partition", command, False)
+            return blocked
+
+        preflight = self._run_preflight(
+            RiskTier.CRITICAL,
+            expected_mode="fastboot",
+            operation="flash",
+            partition=partition,
+        )
+        if preflight:
+            self._log("flash_partition", command, False)
+            return preflight
+
+        backup_path: str | None = None
+        cleanup_backup = False
+        rollback_performed = False
+
+        try:
+            if self._is_boot_class_partition(partition):
+                ok, backup_path_or_error = self._backup_partition(partition, confirm)
+                if not ok:
+                    self._log("flash_partition", command, False)
+                    return ToolResult(
+                        success=False,
+                        error=f"Backup failed, aborting flash: {backup_path_or_error}",
+                        command=command,
+                    )
+                backup_path = backup_path_or_error
 
             exec_cmd = self._exec_fastboot_cmd(subcommand)
             res = self._run_shell_safe(exec_cmd, timeout=300)
-            success = res.returncode == 0
-            self._log("flash_partition", command, success)
-            if not success:
+            flash_success = res.returncode == 0
+
+            if not flash_success:
+                self._log("flash_partition", command, False)
+                if backup_path:
+                    rb_ok, rb_detail = self.gateway.perform_rollback(
+                        self._rollback_from_args,
+                        {
+                            "partition": partition,
+                            "backup_path": backup_path,
+                            "confirm": confirm,
+                        },
+                        reason="flash command failed",
+                    )
+                    rollback_performed = rb_ok
+                    return ToolResult(
+                        success=False,
+                        error=(
+                            f"flash failed (exit {res.returncode}): {res.stderr}; "
+                            f"rollback: {rb_detail if rb_ok else rb_detail}"
+                        ),
+                        command=command,
+                        rollback_performed=rollback_performed,
+                    )
                 return ToolResult(
                     success=False,
                     error=f"flash failed (exit {res.returncode}): {res.stderr}",
                     command=command,
                 )
+
+            # Lightweight post-flash verification: device must still respond in fastboot.
+            post_ok, post_detail = self.gateway.verify_postcondition(
+                self._postcondition_device_responsive,
+                {"confirm": confirm, "device_id": self.device_id},
+                data=None,
+            )
+            if not post_ok:
+                self._log("flash_partition", command, False)
+                if backup_path:
+                    rb_ok, rb_detail = self.gateway.perform_rollback(
+                        self._rollback_from_args,
+                        {
+                            "partition": partition,
+                            "backup_path": backup_path,
+                            "confirm": confirm,
+                        },
+                        reason="post-flash verification failed",
+                    )
+                    rollback_performed = rb_ok
+                    return ToolResult(
+                        success=False,
+                        error=(
+                            f"post-flash verification failed: {post_detail}; "
+                            f"rollback: {rb_detail}"
+                        ),
+                        command=command,
+                        rollback_performed=rollback_performed,
+                    )
+                return ToolResult(
+                    success=False,
+                    error=f"post-flash verification failed: {post_detail}",
+                    command=command,
+                )
+
+            cleanup_backup = True
+            self._log("flash_partition", command, True)
             return ToolResult(
                 success=True,
                 data={"partition": partition, "image_path": resolved},
                 command=command,
+                rollback_performed=False,
             )
         except Exception as exc:
-            self._log("flash_partition", None, False)
-            return self._tool_error("flash_partition", exc)
+            self._log("flash_partition", command, False)
+            if backup_path:
+                try:
+                    rb_ok, rb_detail = self.gateway.perform_rollback(
+                        self._rollback_from_args,
+                        {
+                            "partition": partition,
+                            "backup_path": backup_path,
+                            "confirm": confirm,
+                        },
+                        reason=f"exception during flash: {exc}",
+                    )
+                    rollback_performed = rb_ok
+                except Exception:
+                    pass
+                return ToolResult(
+                    success=False,
+                    error=f"{type(exc).__name__}: {exc}; rollback: {'completed' if rollback_performed else 'failed'}",
+                    command=command,
+                    rollback_performed=rollback_performed,
+                )
+            return self._tool_error("flash_partition", exc, command)
+        finally:
+            if cleanup_backup and backup_path and os.path.exists(backup_path):
+                try:
+                    os.remove(backup_path)
+                except Exception:
+                    pass
 
     def wipe_partition(self, partition: str, confirm: bool = False) -> ToolResult:
         """Erase a partition via fastboot."""

@@ -326,6 +326,31 @@ class SafetyGateway:
         logger.info("audit", extra=entry)
         return result
 
+    def verify_postcondition(
+        self,
+        postcondition_fn: Callable,
+        args: dict[str, Any],
+        data: Any,
+    ) -> tuple[bool, str]:
+        """Run a postcondition check synchronously. Wraps the existing _run_postcondition."""
+        return self._run_postcondition(postcondition_fn, args, data)
+
+    def perform_rollback(
+        self,
+        rollback_fn: Callable,
+        args: dict[str, Any],
+        reason: str,
+    ) -> tuple[bool, str]:
+        """Execute a rollback function synchronously. Returns (success, detail).
+
+        Catches all exceptions so rollback never raises into the caller.
+        """
+        try:
+            rollback_fn(args)
+            return True, "rollback completed"
+        except Exception as exc:
+            return False, f"{type(exc).__name__}: {exc}"
+
     def _run_postcondition(
         self,
         postcondition_fn: Callable,

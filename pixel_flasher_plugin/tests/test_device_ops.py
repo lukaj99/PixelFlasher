@@ -20,6 +20,7 @@ import pytest
 
 from pixel_flasher_plugin.device_ops import DeviceOps
 from pixel_flasher_plugin.result_types import ToolResult
+from pixel_flasher_plugin.safety_engine import SafetyGateway
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +77,10 @@ def _make_ops_with_mocks(monkeypatch: pytest.MonkeyPatch, tmp_image_path: str):
     # evaluate(...) returns (Decision.ALLOW, "") so _evaluate() returns None.
     from pixel_flasher_plugin.safety_engine import Decision
     gateway_mock.evaluate.return_value = (Decision.ALLOW, "")
+    # Default postcondition/rollback return values so tests that reach them
+    # do not fail on MagicMock unpacking.
+    gateway_mock.verify_postcondition.return_value = (True, "ok")
+    gateway_mock.perform_rollback.return_value = (True, "rollback completed")
 
     ops = DeviceOps(device_id="FAKE001", gateway=gateway_mock)
 
@@ -98,8 +103,20 @@ def test_flash_partition_calls_run_preflight(
     """
     img = tmp_path / "boot.img"
     img.write_bytes(b"\x00" * 16)
+    backup = tmp_path / "boot_backup.img"
+    backup.write_bytes(b"\x00" * 16)
 
     ops, _ = _make_ops_with_mocks(monkeypatch, str(img))
+    monkeypatch.setattr(
+        ops,
+        "read_partition",
+        MagicMock(
+            return_value=ToolResult(
+                success=True,
+                data={"local_path": str(backup)},
+            )
+        ),
+    )
 
     preflight_spy = MagicMock(
         return_value=ToolResult(success=False, error="blocked by spy")
@@ -200,8 +217,20 @@ def test_flash_partition_runs_preflight_even_when_confirm_false(
     """
     img = tmp_path / "boot.img"
     img.write_bytes(b"\x00" * 16)
+    backup = tmp_path / "boot_backup.img"
+    backup.write_bytes(b"\x00" * 16)
 
     ops, _ = _make_ops_with_mocks(monkeypatch, str(img))
+    monkeypatch.setattr(
+        ops,
+        "read_partition",
+        MagicMock(
+            return_value=ToolResult(
+                success=True,
+                data={"local_path": str(backup)},
+            )
+        ),
+    )
 
     preflight_spy = MagicMock(return_value=None)  # preflight passes
     monkeypatch.setattr(DeviceOps, "_run_preflight", preflight_spy)
@@ -289,3 +318,171 @@ def test_read_partition_size_guard(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.success is False
     assert "exceeds" in (result.error or "").lower()
     assert "4294967296" in (result.error or "")
+
+
+# ---------------------------------------------------------------------------
+# Rollback + postcondition pipeline for boot-class partitions
+# ---------------------------------------------------------------------------
+def test_flash_partition_rollback_on_boot_flash_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """A failed boot flash must re-flash the backup and report rollback_performed."""
+    img = tmp_path / "boot.img"
+    img.write_bytes(b"new image")
+    backup = tmp_path / "boot_backup.img"
+    backup.write_bytes(b"original image")
+
+    ops, _ = _make_ops_with_mocks(monkeypatch, str(img))
+    monkeypatch.setattr(
+        ops,
+        "read_partition",
+        MagicMock(
+            return_value=ToolResult(
+                success=True,
+                data={"local_path": str(backup)},
+            )
+        ),
+    )
+    # Use a real SafetyGateway so perform_rollback / verify_postcondition execute.
+    ops.gateway = SafetyGateway(config=None, device_ops=ops)
+    # Bypass preflight so the test targets the rollback path, not preflight.
+    monkeypatch.setattr(DeviceOps, "_run_preflight", lambda *args, **kwargs: None)
+
+    commands: list[str] = []
+
+    def _fake_run(cmd: str, timeout: int | None = None):
+        mock = MagicMock()
+        commands.append(cmd)
+        # The initial flash of the new image fails; the rollback flash of the
+        # backup succeeds; any subsequent getvar product succeeds.
+        if "flash" in cmd and str(backup) not in cmd:
+            mock.returncode = 1
+            mock.stdout = ""
+            mock.stderr = "flash write failure"
+        else:
+            mock.returncode = 0
+            mock.stdout = "product: foo"
+            mock.stderr = ""
+        return mock
+
+    ops._run_shell_safe = MagicMock(side_effect=_fake_run)  # type: ignore[method-assign]
+
+    result = ops.flash_partition("boot", str(img), confirm=True)
+
+    assert result.success is False
+    assert result.rollback_performed is True
+    rollback_cmds = [c for c in commands if "flash" in c and str(backup) in c]
+    assert len(rollback_cmds) >= 1, (
+        f"Expected rollback flash command using backup {backup}; got {commands}"
+    )
+
+
+def test_flash_partition_rollback_on_postcondition_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """If the device is unresponsive after a boot flash, rollback the backup."""
+    img = tmp_path / "boot.img"
+    img.write_bytes(b"new image")
+    backup = tmp_path / "boot_backup.img"
+    backup.write_bytes(b"original image")
+
+    ops, _ = _make_ops_with_mocks(monkeypatch, str(img))
+    monkeypatch.setattr(
+        ops,
+        "read_partition",
+        MagicMock(
+            return_value=ToolResult(
+                success=True,
+                data={"local_path": str(backup)},
+            )
+        ),
+    )
+    # Use a real SafetyGateway so perform_rollback / verify_postcondition execute.
+    ops.gateway = SafetyGateway(config=None, device_ops=ops)
+    # Bypass preflight so the test targets the postcondition/rollback path.
+    monkeypatch.setattr(DeviceOps, "_run_preflight", lambda *args, **kwargs: None)
+
+    commands: list[str] = []
+
+    def _fake_run(cmd: str, timeout: int | None = None):
+        mock = MagicMock()
+        commands.append(cmd)
+        if "getvar product" in cmd:
+            # Device is unresponsive after the flash.
+            mock.returncode = 1
+            mock.stdout = ""
+            mock.stderr = "device not responding"
+        else:
+            mock.returncode = 0
+            mock.stdout = ""
+            mock.stderr = ""
+        return mock
+
+    ops._run_shell_safe = MagicMock(side_effect=_fake_run)  # type: ignore[method-assign]
+
+    result = ops.flash_partition("boot", str(img), confirm=True)
+
+    assert result.success is False
+    assert result.rollback_performed is True
+    assert "post-flash verification failed" in (result.error or "").lower()
+    rollback_cmds = [c for c in commands if "flash" in c and str(backup) in c]
+    assert len(rollback_cmds) >= 1
+
+
+def test_flash_partition_no_rollback_for_non_boot_partition(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Non-boot-class partitions do not trigger backup/rollback on flash failure."""
+    img = tmp_path / "system.img"
+    img.write_bytes(b"system image")
+
+    ops, _ = _make_ops_with_mocks(monkeypatch, str(img))
+    ops.read_partition = MagicMock()  # type: ignore[method-assign]
+
+    def _fake_run(cmd: str, timeout: int | None = None):
+        mock = MagicMock()
+        if "flash" in cmd:
+            mock.returncode = 1
+            mock.stdout = ""
+            mock.stderr = "flash write failure"
+        else:
+            mock.returncode = 0
+            mock.stdout = ""
+            mock.stderr = ""
+        return mock
+
+    ops._run_shell_safe = MagicMock(side_effect=_fake_run)  # type: ignore[method-assign]
+
+    result = ops.flash_partition("system", str(img), confirm=True)
+
+    assert result.success is False
+    assert result.rollback_performed is False
+    ops.read_partition.assert_not_called()
+
+
+def test_flash_partition_aborts_when_backup_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """If backup of a boot-class partition fails, flash_partition must abort."""
+    img = tmp_path / "boot.img"
+    img.write_bytes(b"new image")
+
+    ops, _ = _make_ops_with_mocks(monkeypatch, str(img))
+    monkeypatch.setattr(
+        ops,
+        "read_partition",
+        MagicMock(
+            return_value=ToolResult(
+                success=False,
+                error="device not in adb mode",
+            )
+        ),
+    )
+
+    result = ops.flash_partition("boot", str(img), confirm=True)
+
+    assert result.success is False
+    assert "backup failed" in (result.error or "").lower()
+    # No flash or rollback should have been attempted.
+    for call in ops._run_shell_safe.call_args_list:
+        assert "flash" not in call.args[0]
