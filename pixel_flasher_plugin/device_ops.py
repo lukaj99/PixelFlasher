@@ -19,6 +19,7 @@ import tempfile
 import time
 import xml.etree.ElementTree as ET
 import zipfile
+from datetime import datetime, timezone
 from typing import Any, ClassVar
 
 from pixel_flasher_plugin import boot_patcher, command_validator, telemetry
@@ -79,6 +80,36 @@ class DeviceOps:
         "SukiSU",
         "Wild_KSU",
     }
+
+    _SUPPORTED_CHECKER_APPS: ClassVar[list[dict[str, Any]]] = [
+        {
+            "package": "gr.nikolasspyr.integritycheck",
+            "name": "Play Integrity API Checker",
+            "button_text": "CHECK",
+            "button_class": None,
+            "parser": "process_pi_xml_piac",
+            "probe_method_key": "live_piac",
+            "quota_strings": ["The calling app is making too many requests to the API"],
+        },
+        {
+            "package": "com.henrikherzig.playintegritychecker",
+            "name": "Simple Play Integrity Checker",
+            "button_text": "Make Play Integrity Request",
+            "button_class": None,
+            "parser": "process_pi_xml_spic",
+            "probe_method_key": "live_spic",
+            "quota_strings": ["Integrity API error (-8)"],
+        },
+        {
+            "package": "com.thend.integritychecker",
+            "name": "Android Integrity Checker",
+            "button_text": None,
+            "button_class": "android.widget.Button",
+            "parser": "process_pi_xml_aic",
+            "probe_method_key": "live_aic",
+            "quota_strings": ["Integrity API error"],
+        },
+    ]
 
     def __init__(
         self,
@@ -1644,47 +1675,423 @@ class DeviceOps:
             self._log("get_pif_status", None, False)
             return self._tool_error("get_pif_status", exc)
 
-    def check_play_integrity(self) -> ToolResult:
-        """Report the PIF Magisk module state.
+    # ------------------------------------------------------------------
+    # Play Integrity live-probe helpers
+    # ------------------------------------------------------------------
+    def _read_pi_module_state(self) -> dict[str, Any]:
+        """Read PIF module state: installed, enabled, version, name."""
+        module_dir = "/data/adb/modules/playintegrityfix"
+        module_prop = self._read_module_prop()
+        module_installed = bool(module_prop)
+        module_version = module_prop.get("version")
 
-        This does NOT invoke the Play Integrity API (that requires a device UI
-        and a calling app). It only reports whether the PIF module is installed
-        and enabled on the device.
-        """
-        try:
-            module_dir = "/data/adb/modules/playintegrityfix"
-            module_prop = self._read_module_prop()
-            module_installed = bool(module_prop)
-            module_version = module_prop.get("version")
-
-            disable_path = f"{module_dir}/disable"
-            subcommand = f"shell ls {self._q(disable_path)}"
-            command = self._adb_cmd(subcommand)
-            blocked = self._evaluate(command, RiskTier.INFO, confirm=False)
-            if blocked:
-                return ToolResult(
-                    success=False,
-                    error=blocked.error or "PIF disable check blocked by safety gateway",
-                    command=command,
-                )
+        disable_path = f"{module_dir}/disable"
+        subcommand = f"shell ls {self._q(disable_path)}"
+        command = self._adb_cmd(subcommand)
+        blocked = self._evaluate(command, RiskTier.INFO, False)
+        module_enabled = False
+        if not blocked:
             exec_cmd = self._exec_adb_cmd(subcommand)
             res = self._run_shell_safe(exec_cmd, timeout=30)
             # If the disable file exists, the module is disabled.
             module_enabled = module_installed and res.returncode != 0
 
-            self._log("check_play_integrity", command, True)
+        return {
+            "module_installed": module_installed,
+            "module_enabled": module_enabled,
+            "module_version": module_version,
+            "module_name": module_prop.get("name"),
+        }
+
+    def _find_installed_checker_app(self, override: str | None = None) -> dict[str, Any] | None:
+        """Detect the highest-priority installed checker app."""
+        dev = self._lazy_device()
+        output = dev.get_package_list("all")
+        if not isinstance(output, str):
+            return None
+
+        installed = {
+            line.strip().replace("package:", "")
+            for line in output.splitlines()
+            if line.strip().startswith("package:")
+        }
+
+        if override:
+            for app in self._SUPPORTED_CHECKER_APPS:
+                if app["package"] == override:
+                    return app if override in installed else None
+            return None
+
+        for app in self._SUPPORTED_CHECKER_APPS:
+            if app["package"] in installed:
+                return app
+        return None
+
+    def _uiautomator_dump_and_pull(
+        self,
+        remote_path: str,
+        local_path: str,
+        retries: int = 3,
+    ) -> bool:
+        """Dump UI hierarchy and pull XML to host. Returns True on success."""
+        subcommand = f"shell uiautomator dump {self._q(remote_path)}"
+        command = self._adb_cmd(subcommand)
+        blocked = self._evaluate(command, RiskTier.INFO, False)
+        if blocked:
+            return False
+
+        exec_cmd = self._exec_adb_cmd(subcommand)
+        for _ in range(retries):
+            res = self._run_shell_safe(exec_cmd, timeout=30)
+            if res.returncode == 0:
+                break
+            time.sleep(1)
+        else:
+            return False
+
+        subcommand = f"pull {self._q(remote_path)} {self._q(local_path)}"
+        command = self._adb_cmd(subcommand)
+        blocked = self._evaluate(command, RiskTier.INFO, False)
+        if blocked:
+            return False
+
+        exec_cmd = self._exec_adb_cmd(subcommand)
+        res = self._run_shell_safe(exec_cmd, timeout=30)
+        return res.returncode == 0 and os.path.isfile(local_path)
+
+    def _find_button_center(
+        self,
+        xml_content: str,
+        button_text: str | None,
+        button_class: str | None,
+    ) -> tuple[int, int] | None:
+        """Parse UI hierarchy XML to find the center of the check button."""
+        if button_text:
+            pattern = re.compile(
+                rf'(?=[^>]*\btext="{re.escape(button_text)}")'
+                rf'[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"',
+                re.DOTALL,
+            )
+            match = pattern.search(xml_content)
+            if match:
+                x = (int(match.group(1)) + int(match.group(3))) // 2
+                y = (int(match.group(2)) + int(match.group(4))) // 2
+                return (x, y)
+
+        if button_class:
+            pattern = re.compile(
+                rf'(?=[^>]*\bclass="{re.escape(button_class)}")'
+                rf'[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"',
+                re.DOTALL,
+            )
+            match = pattern.search(xml_content)
+            if match:
+                x = (int(match.group(1)) + int(match.group(3))) // 2
+                y = (int(match.group(2)) + int(match.group(4))) // 2
+                return (x, y)
+
+        return None
+
+    def _tap(self, x: int, y: int) -> bool:
+        """Send a synthetic tap at screen coordinates."""
+        subcommand = f"shell input tap {x} {y}"
+        command = self._adb_cmd(subcommand)
+        blocked = self._evaluate(command, RiskTier.INFO, False)
+        if blocked:
+            return False
+
+        exec_cmd = self._exec_adb_cmd(subcommand)
+        res = self._run_shell_safe(exec_cmd, timeout=30)
+        return res.returncode == 0
+
+    def _desc_to_bool(self, value: str) -> bool | None:
+        """Map a checker-app content description to a pass/fail boolean."""
+        normalized = value.strip().lower()
+        if normalized in {"true", "checked", "check", "pass", "yes", "✓", "[✓]"}:
+            return True
+        if normalized in {"false", "unchecked", "uncheck", "fail", "no", "✗", "[✗]", "x"}:
+            return False
+        return None
+
+    def _map_verdict(self, raw: str, quota_strings: list[str]) -> dict[str, Any]:
+        """Map a raw checker-app result string to structured verdict fields."""
+        raw = raw or ""
+        result: dict[str, Any] = {
+            "basic_integrity": None,
+            "device_integrity": None,
+            "strong_integrity": None,
+            "verdict_raw": raw,
+            "quota_reached": False,
+            "error": None,
+        }
+
+        lower = raw.lower()
+        if "quota reached" in lower:
+            result["quota_reached"] = True
+            result["error"] = "Checker app API quota exceeded"
+            return result
+        for quota_string in quota_strings:
+            if quota_string.lower() in lower:
+                result["quota_reached"] = True
+                result["error"] = "Checker app API quota exceeded"
+                return result
+
+        if "MEETS_VIRTUAL_INTEGRITY" in raw:
+            result["error"] = "MEETS_VIRTUAL_INTEGRITY (emulator, not applicable)"
+            return result
+
+        if "MEETS_STRONG_INTEGRITY" in raw:
+            result["basic_integrity"] = True
+            result["device_integrity"] = True
+            result["strong_integrity"] = True
+        elif "MEETS_DEVICE_INTEGRITY" in raw:
+            result["basic_integrity"] = True
+            result["device_integrity"] = True
+            result["strong_integrity"] = False
+        elif "MEETS_BASIC_INTEGRITY" in raw:
+            result["basic_integrity"] = True
+            result["device_integrity"] = False
+            result["strong_integrity"] = False
+        elif "NO_INTEGRITY" in raw:
+            result["basic_integrity"] = False
+            result["device_integrity"] = False
+            result["strong_integrity"] = False
+        else:
+            # Play Integrity API Checker returns content-desc lines.
+            for line in raw.splitlines():
+                if ":" not in line:
+                    continue
+                key, _, value = line.partition(":")
+                key = key.strip().lower()
+                value = value.strip()
+                if key == "basic_integrity":
+                    result["basic_integrity"] = self._desc_to_bool(value)
+                elif key == "device_integrity":
+                    result["device_integrity"] = self._desc_to_bool(value)
+                elif key == "strong_integrity":
+                    result["strong_integrity"] = self._desc_to_bool(value)
+
+            if all(
+                v is None
+                for v in (
+                    result["basic_integrity"],
+                    result["device_integrity"],
+                    result["strong_integrity"],
+                )
+            ):
+                result["error"] = "Could not parse verdict from checker app UI"
+
+        if (
+            result.get("device_integrity") is True
+            and result.get("strong_integrity") is False
+            and not result.get("quota_reached")
+        ):
+            result["error"] = result["error"] or "STRONG requires a valid keybox (see LJD-284)"
+
+        return result
+
+    def _parse_app_verdict(
+        self,
+        local_xml_path: str,
+        app_config: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Run the app-specific XML parser and map the result."""
+        parser_name = app_config["parser"]
+        parser = getattr(_runtime, parser_name, None)
+        if parser is None:
+            return None
+
+        try:
+            raw = parser(local_xml_path)
+        except Exception:
+            return None
+
+        if raw == -1 or not isinstance(raw, str):
+            return None
+
+        return self._map_verdict(raw, app_config.get("quota_strings", []))
+
+    def check_play_integrity(
+        self,
+        probe_method: str = "auto",
+        checker_app: str | None = None,
+        timeout: int = 30,
+    ) -> ToolResult:
+        """Return a live Play Integrity verdict using an installed checker app.
+
+        This tool launches a checker app, taps its CHECK button via ``input tap``,
+        and parses the resulting UI hierarchy XML. It is read-only with respect to
+        device state, but it is NOT fully headless: the display must be on and
+        unlocked for Play Services to process the integrity request.
+
+        Parameters:
+            probe_method: ``auto`` (live if a checker app is installed, else
+                module state), ``module_state_only``, or ``live`` (error if no
+                checker app is installed).
+            checker_app: Optional package name override. Must be a supported app.
+            timeout: Seconds to wait for the verdict after tapping CHECK.
+        """
+        if probe_method not in {"auto", "module_state_only", "live"}:
+            return ToolResult(
+                success=False,
+                error=f"Invalid probe_method: {probe_method}. Use auto, module_state_only, or live.",
+            )
+        if timeout < 1:
+            return ToolResult(success=False, error="timeout must be >= 1 second")
+
+        try:
+            module_state = self._read_pi_module_state()
+        except Exception as exc:
+            module_state = {
+                "module_installed": False,
+                "module_enabled": False,
+                "module_version": None,
+                "module_name": None,
+            }
+
+        base_output: dict[str, Any] = {
+            **module_state,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "probe_method": "module_state_only",
+            "checker_app": None,
+            "verdict_raw": None,
+            "quota_reached": False,
+            "error": None,
+        }
+
+        if probe_method == "module_state_only":
+            self._log("check_play_integrity", None, True)
+            return ToolResult(success=True, data=base_output)
+
+        # Live probe requires an ADB device with an unlocked display.
+        try:
+            dev = self._lazy_device()
+        except Exception as exc:
+            msg = f"Device not available: {exc}"
+            if probe_method == "live":
+                base_output["error"] = msg
+                return ToolResult(success=False, error=msg, data=base_output)
+            return ToolResult(success=True, data=base_output, warnings=[msg])
+
+        if getattr(dev, "true_mode", None) != "adb":
+            msg = "Device is not in ADB mode"
+            if probe_method == "live":
+                base_output["error"] = msg
+                return ToolResult(success=False, error=msg, data=base_output)
+            return ToolResult(success=True, data=base_output, warnings=[msg])
+
+        if not dev.is_display_unlocked():
+            msg = "Display must be unlocked for Play Integrity API to function"
+            if probe_method == "live":
+                base_output["error"] = msg
+                return ToolResult(success=False, error=msg, data=base_output)
+            return ToolResult(success=True, data=base_output, warnings=[msg])
+
+        app_config = self._find_installed_checker_app(checker_app)
+        if app_config is None:
+            if checker_app:
+                msg = f"Checker app {checker_app!r} is not installed or not supported"
+            else:
+                msg = "No supported checker app installed"
+            if probe_method == "live":
+                base_output["error"] = msg
+                return ToolResult(success=False, error=msg, data=base_output)
             return ToolResult(
                 success=True,
-                data={
-                    "module_installed": module_installed,
-                    "module_enabled": module_enabled,
-                    "module_version": module_version,
-                    "module_name": module_prop.get("name"),
-                },
+                data=base_output,
+                warnings=[
+                    f"{msg}. Install Play Integrity API Checker "
+                    "(gr.nikolasspyr.integritycheck) to get a live verdict.",
+                ],
             )
-        except Exception as exc:
-            self._log("check_play_integrity", None, False)
-            return self._tool_error("check_play_integrity", exc)
+
+        package = app_config["package"]
+        base_output["checker_app"] = package
+        base_output["probe_method"] = app_config.get("probe_method_key", "live_unknown")
+
+        # Kill any running instance and launch the app.
+        stop_subcommand = f"shell am force-stop {self._q(package)}"
+        stop_command = self._adb_cmd(stop_subcommand)
+        blocked = self._evaluate(stop_command, RiskTier.INFO, False)
+        if not blocked:
+            exec_cmd = self._exec_adb_cmd(stop_subcommand)
+            self._run_shell_safe(exec_cmd, timeout=30)
+
+        start_subcommand = f"shell am start -n {self._q(package)}/.MainActivity"
+        start_command = self._adb_cmd(start_subcommand)
+        blocked = self._evaluate(start_command, RiskTier.INFO, False)
+        if blocked:
+            base_output["error"] = blocked.error
+            return ToolResult(success=False, error=blocked.error, data=base_output)
+
+        exec_cmd = self._exec_adb_cmd(start_subcommand)
+        res = self._run_shell_safe(exec_cmd, timeout=30)
+        if res.returncode != 0:
+            msg = f"Failed to launch checker app {package}: {res.stderr}"
+            base_output["error"] = msg
+            return ToolResult(success=False, error=msg, data=base_output)
+
+        time.sleep(2)
+
+        remote_xml = "/data/local/tmp/pi_mcp.xml"
+        local_xml = tempfile.NamedTemporaryFile(suffix=".xml", delete=False).name
+        try:
+            if not self._uiautomator_dump_and_pull(remote_xml, local_xml):
+                msg = "Failed to dump UI hierarchy for check button"
+                base_output["error"] = msg
+                return ToolResult(success=False, error=msg, data=base_output)
+
+            with open(local_xml, "r", encoding="utf-8", errors="replace") as f:
+                xml_content = f.read()
+
+            center = self._find_button_center(
+                xml_content,
+                app_config.get("button_text"),
+                app_config.get("button_class"),
+            )
+            if center is None:
+                msg = "Could not find check button in checker app UI"
+                base_output["error"] = msg
+                return ToolResult(success=False, error=msg, data=base_output)
+
+            if not self._tap(*center):
+                msg = "Failed to tap check button"
+                base_output["error"] = msg
+                return ToolResult(success=False, error=msg, data=base_output)
+
+            # Poll for the verdict.
+            deadline = time.monotonic() + timeout
+            parsed_verdict: dict[str, Any] | None = None
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(3, remaining))
+                if not self._uiautomator_dump_and_pull(remote_xml, local_xml):
+                    continue
+                parsed_verdict = self._parse_app_verdict(local_xml, app_config)
+                if parsed_verdict is not None and (
+                    parsed_verdict.get("quota_reached")
+                    or parsed_verdict.get("basic_integrity") is not None
+                ):
+                    break
+
+            if parsed_verdict is None or (
+                not parsed_verdict.get("quota_reached")
+                and parsed_verdict.get("basic_integrity") is None
+            ):
+                msg = f"Timed out after {timeout}s waiting for Play Integrity verdict"
+                base_output["error"] = msg
+                return ToolResult(success=False, error=msg, data=base_output)
+
+            base_output.update(parsed_verdict)
+            self._log("check_play_integrity", start_command, True)
+            return ToolResult(success=True, data=base_output)
+        finally:
+            try:
+                os.remove(local_xml)
+            except Exception:
+                pass
 
     def update_pif(self, pif_json: str | dict, confirm: bool = False) -> ToolResult:
         """Push a new PIF config to the device.

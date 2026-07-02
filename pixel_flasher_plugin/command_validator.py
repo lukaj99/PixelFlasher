@@ -18,6 +18,11 @@ class CommandValidator:
         re.compile(r"^adb\s+-s\s+\S+\s+shell\s+su\s+-c\s+\"dd\s+if=\S+\s+bs=1M\s+2>/dev/null\"\s*>\s*\S+$"),
         re.compile(r"^adb\s+-s\s+\S+\s+shell\s+(uname|ls|cat|stat)(\s+\S+)*$"),
         re.compile(r"^adb\s+-s\s+\S+\s+(install|uninstall|push|pull|reboot|wait-for-\S+|get-state)(\s+\S+)*$"),
+        # Play Integrity live probe: launch checker app, dump UI hierarchy, tap button.
+        re.compile(r"^adb\s+-s\s+\S+\s+shell\s+am\s+force-stop\s+\S+$"),
+        re.compile(r"^adb\s+-s\s+\S+\s+shell\s+am\s+start\s+-n\s+\S+/\S+$"),
+        re.compile(r"^adb\s+-s\s+\S+\s+shell\s+uiautomator\s+dump\s+\S+$"),
+        re.compile(r"^adb\s+-s\s+\S+\s+shell\s+input\s+tap\s+\d+\s+\d+$"),
         # Host-side redirect used by read_partition; partition is sanitized before
         # this pattern is reached.
         re.compile(r"^adb\s+-s\s+\S+\s+shell\s+cat\s+\S+\s*>\s*\S+$"),

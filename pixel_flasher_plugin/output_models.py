@@ -200,6 +200,14 @@ class PlayIntegrityOutput(BaseModel):
     module_installed: bool = Field(default=False, description="Whether the PIF Magisk module is present")
     module_enabled: bool = Field(default=False, description="Whether the PIF Magisk module is enabled")
     module_version: str | None = Field(default=None, description="PIF module version from module.prop")
+    probe_method: str | None = Field(
+        default=None,
+        description="How the verdict was obtained: 'module_state_only' | 'live_piac' | 'live_spic' | 'live_aic'",
+    )
+    checker_app: str | None = Field(default=None, description="Package name of the checker app used (if live probe)")
+    verdict_raw: str | None = Field(default=None, description="Raw verdict string from the checker app")
+    quota_reached: bool = Field(default=False, description="Whether the checker app's Google API quota was exceeded")
+    error: str | None = Field(default=None, description="Error message if the live probe failed")
 
 
 class BackupOutput(BaseModel):

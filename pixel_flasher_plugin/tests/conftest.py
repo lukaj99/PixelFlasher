@@ -91,11 +91,16 @@ def _stub_get_device():
     # reference is patched. The dispatcher also references it via
     # ``self._get_device`` which uses the same import.
     safety_engine.headless_runtime.get_device = headless_runtime.get_device  # type: ignore[attr-defined]
+    # device_ops imports ``get_device`` by name; patch that reference too.
+    from pixel_flasher_plugin import device_ops
+
+    device_ops.get_device = headless_runtime.get_device  # type: ignore[attr-defined]
     try:
         yield fake
     finally:
         headless_runtime.get_device = original  # type: ignore[assignment]
         safety_engine.headless_runtime.get_device = original  # type: ignore[attr-defined]
+        device_ops.get_device = original  # type: ignore[attr-defined]
 
 
 @pytest.fixture(scope="session")

@@ -714,17 +714,26 @@ def update_pif(
 def check_play_integrity(
     ctx: Context,
     device_id: str,
-    dry_run: bool = True,
-    confirm: bool = False,
+    probe_method: str = "auto",
+    checker_app: str | None = None,
+    timeout: int = 30,
 ) -> PlayIntegrityOutput:
-    """Report the Play Integrity Fix module state on the device.
+    """Return a live Play Integrity verdict (BASIC / DEVICE / STRONG).
 
-    This tool does NOT invoke the Play Integrity API (that requires a device UI
-    and a calling app). It only reports whether the PIF Magisk module is
-    installed and enabled by reading module.prop and checking for the disable
-    file.
+    Launches an installed checker app, taps its CHECK button, and parses the
+    resulting UI hierarchy. This is an INFO-tier read-only tool, but it is NOT
+    fully headless: the device display must be on and unlocked for Play Services
+    to process the integrity request.
+
+    probe_method: auto | module_state_only | live
+    checker_app: optional package name override (must be a supported app)
+    timeout: seconds to wait for the verdict after tapping CHECK
     """
-    result = _ops(device_id, ctx).check_play_integrity()
+    result = _ops(device_id, ctx).check_play_integrity(
+        probe_method=probe_method,
+        checker_app=checker_app,
+        timeout=timeout,
+    )
     return _to_output(result, PlayIntegrityOutput)
 
 
