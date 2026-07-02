@@ -486,3 +486,225 @@ def test_flash_partition_aborts_when_backup_fails(
     # No flash or rollback should have been attempted.
     for call in ops._run_shell_safe.call_args_list:
         assert "flash" not in call.args[0]
+
+
+# ---------------------------------------------------------------------------
+# Read-only deferred stubs (LJD-277)
+# ---------------------------------------------------------------------------
+def _make_readonly_ops(monkeypatch: pytest.MonkeyPatch):
+    """Return a DeviceOps instance with a mocked gateway and shell runner."""
+    gateway_mock = MagicMock()
+    from pixel_flasher_plugin.safety_engine import Decision
+    gateway_mock.evaluate.return_value = (Decision.ALLOW, "")
+    ops = DeviceOps(device_id="FAKE001", gateway=gateway_mock)
+    ops._run_shell_safe = MagicMock(return_value=MagicMock(returncode=0, stdout="", stderr=""))  # type: ignore[method-assign]
+    return ops
+
+
+def test_get_pif_status_reads_json_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """get_pif_status parses custom.pif.json when present."""
+    ops = _make_readonly_ops(monkeypatch)
+
+    def _fake_run(cmd: str, timeout: int | None = None):
+        mock = MagicMock()
+        if "module.prop" in cmd:
+            mock.returncode = 0
+            mock.stdout = "name=PlayIntegrityFix\nversion=v17.9\n"
+        elif "custom.pif.json" in cmd:
+            mock.returncode = 0
+            mock.stdout = '{"PRODUCT":"foo","DEVICE":"bar"}\n'
+        else:
+            mock.returncode = 1
+            mock.stdout = ""
+            mock.stderr = "No such file"
+        return mock
+
+    ops._run_shell_safe = MagicMock(side_effect=_fake_run)  # type: ignore[method-assign]
+
+    result = ops.get_pif_status()
+
+    assert result.success is True
+    data = result.data or {}
+    assert data["pif_exists"] is True
+    assert data["pif_path"].endswith("custom.pif.json")
+    assert data["pif_content"] == {"PRODUCT": "foo", "DEVICE": "bar"}
+    assert data["module_version"] == "v17.9"
+
+
+def test_get_pif_status_falls_back_to_prop_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    """get_pif_status falls back to custom.pif.prop when JSON is missing."""
+    ops = _make_readonly_ops(monkeypatch)
+
+    def _fake_run(cmd: str, timeout: int | None = None):
+        mock = MagicMock()
+        if "module.prop" in cmd:
+            mock.returncode = 0
+            mock.stdout = "name=PlayIntegrityFix\nversion=v17.9\n"
+        elif "custom.pif.json" in cmd:
+            mock.returncode = 1
+            mock.stdout = ""
+            mock.stderr = "No such file"
+        elif "custom.pif.prop" in cmd:
+            mock.returncode = 0
+            mock.stdout = "PRODUCT=baz\nDEVICE=qux\n"
+        else:
+            mock.returncode = 1
+            mock.stdout = ""
+        return mock
+
+    ops._run_shell_safe = MagicMock(side_effect=_fake_run)  # type: ignore[method-assign]
+
+    result = ops.get_pif_status()
+
+    assert result.success is True
+    data = result.data or {}
+    assert data["pif_exists"] is True
+    assert data["pif_path"].endswith("custom.pif.prop")
+    assert data["pif_content"] == {"PRODUCT": "baz", "DEVICE": "qux"}
+
+
+def test_check_play_integrity_reports_module_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """check_play_integrity returns module state when no disable file exists."""
+    ops = _make_readonly_ops(monkeypatch)
+
+    def _fake_run(cmd: str, timeout: int | None = None):
+        mock = MagicMock()
+        if "module.prop" in cmd:
+            mock.returncode = 0
+            mock.stdout = "name=PlayIntegrityFix\nversion=v17.9\n"
+        elif "disable" in cmd:
+            mock.returncode = 1
+            mock.stdout = ""
+            mock.stderr = "No such file"
+        else:
+            mock.returncode = 1
+        return mock
+
+    ops._run_shell_safe = MagicMock(side_effect=_fake_run)  # type: ignore[method-assign]
+
+    result = ops.check_play_integrity()
+
+    assert result.success is True
+    data = result.data or {}
+    assert data["module_installed"] is True
+    assert data["module_enabled"] is True
+    assert data["module_version"] == "v17.9"
+
+
+def test_check_play_integrity_reports_module_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """check_play_integrity reports disabled when the disable file exists."""
+    ops = _make_readonly_ops(monkeypatch)
+
+    def _fake_run(cmd: str, timeout: int | None = None):
+        mock = MagicMock()
+        if "module.prop" in cmd:
+            mock.returncode = 0
+            mock.stdout = "name=PlayIntegrityFix\nversion=v17.9\n"
+        elif "disable" in cmd:
+            mock.returncode = 0
+            mock.stdout = "/data/adb/modules/playintegrityfix/disable\n"
+        else:
+            mock.returncode = 1
+        return mock
+
+    ops._run_shell_safe = MagicMock(side_effect=_fake_run)  # type: ignore[method-assign]
+
+    result = ops.check_play_integrity()
+
+    assert result.success is True
+    data = result.data or {}
+    assert data["module_installed"] is True
+    assert data["module_enabled"] is False
+
+
+def test_list_backups_parses_matching_files(monkeypatch: pytest.MonkeyPatch) -> None:
+    """list_backups returns boot backup entries with sizes and dates."""
+    ops = _make_readonly_ops(monkeypatch)
+    ops._run_shell_safe.return_value = MagicMock(
+        returncode=0,
+        stdout=(
+            "total 64\n"
+            "drwxrwxrwx 2 root root 4096 2024-01-15 08:30 .\n"
+            "drwxrwxrwx 3 root root 4096 2024-01-15 08:30 ..\n"
+            "-rw-rw---- 1 root root 67108864 2024-01-15 08:31 boot_20240115.img\n"
+            "-rw-rw---- 1 root root 25165824 2024-01-15 08:32 boot_20240115.img.gz\n"
+            "-rw-rw---- 1 root root 1234 2024-01-15 08:33 unrelated.txt\n"
+        ),
+    )
+
+    result = ops.list_backups()
+
+    assert result.success is True
+    backups = (result.data or {}).get("backups", [])
+    assert len(backups) == 2
+    names = {b["name"] for b in backups}
+    assert names == {"boot_20240115.img", "boot_20240115.img.gz"}
+    img_entry = next(b for b in backups if b["name"] == "boot_20240115.img")
+    assert img_entry["size"] == 67108864
+    assert img_entry["date"] == "2024-01-15 08:31"
+
+
+def test_list_backups_returns_empty_when_dir_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """list_backups returns an empty list (not an error) when the backup dir is absent."""
+    ops = _make_readonly_ops(monkeypatch)
+    ops._run_shell_safe.return_value = MagicMock(
+        returncode=1,
+        stdout="",
+        stderr="No such file or directory",
+    )
+
+    result = ops.list_backups()
+
+    assert result.success is True
+    assert (result.data or {}).get("backups") == []
+    assert (result.data or {}).get("count") == 0
+
+
+def test_avb_verify_image_uses_avbtool(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """avb_verify_image delegates signature verification to avbtool."""
+    import sys
+
+    img = tmp_path / "vbmeta.img"
+    img.write_bytes(b"fake vbmeta image")
+
+    fake_avbtool = MagicMock()
+    fake_avbtool.AvbError = Exception
+    fake_tool = MagicMock()
+    fake_tool.info_image.return_value = {"Algorithm": "SHA256_RSA4096", "Hash Algorithm": "sha256"}
+    fake_tool.verify_image.return_value = None
+    fake_avbtool.AvbTool.return_value = fake_tool
+    monkeypatch.setitem(sys.modules, "avbtool", fake_avbtool)
+
+    ops = DeviceOps(device_id="FAKE001")
+    result = ops.avb_verify_image(str(img))
+
+    assert result.success is True
+    data = result.data or {}
+    assert data["valid"] is True
+    assert data["algorithm"] == "SHA256_RSA4096"
+    assert data["hash"] == "sha256"
+    fake_tool.verify_image.assert_called_once_with(str(img), None, None, False, False)
+
+
+def test_avb_verify_image_reports_signature_failure(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """avb_verify_image returns valid=False when avbtool reports a bad signature."""
+    import sys
+
+    img = tmp_path / "vbmeta.img"
+    img.write_bytes(b"fake vbmeta image")
+
+    fake_avbtool = MagicMock()
+    fake_avbtool.AvbError = Exception
+    fake_tool = MagicMock()
+    fake_tool.info_image.return_value = {"Algorithm": "SHA256_RSA4096"}
+    fake_tool.verify_image.side_effect = Exception("Signature check failed")
+    fake_avbtool.AvbTool.return_value = fake_tool
+    monkeypatch.setitem(sys.modules, "avbtool", fake_avbtool)
+
+    ops = DeviceOps(device_id="FAKE001")
+    result = ops.avb_verify_image(str(img))
+
+    assert result.success is True
+    data = result.data or {}
+    assert data["valid"] is False
+    assert "Signature check failed" in (data.get("error") or "")

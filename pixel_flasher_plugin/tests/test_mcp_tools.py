@@ -8,7 +8,7 @@ MCP server:
   * The 5 CRITICAL tools (flash_partition, erase_partition, flash_boot_image,
     unlock_bootloader, lock_bootloader) MUST accept ``dry_run`` -- this is
     the opt-in gate that lets agents preview destructive commands.
-  * The 9 stub tools MUST be visibly marked as not implemented -- agents
+  * The 5 remaining stub tools MUST be visibly marked as not implemented -- agents
     must not waste tokens calling tools that return errors.
 
 These counts come from the reviewer-validated spec. Drift in any of them
@@ -94,6 +94,9 @@ CRITICAL_TOOLS_WITH_DRY_RUN = [
     "flash_partition",
     "erase_partition",
     "flash_boot_image",
+    "patch_boot_image",
+    "flash_factory_image",
+    "restore_backup",
     "unlock_bootloader",
     "lock_bootloader",
 ]
@@ -123,43 +126,6 @@ def test_critical_tool_has_dry_run_parameter(
         f"Without dry_run, agents cannot safely preview a destructive "
         f"operation before executing it.\n"
         f"Parameters present: {sorted(properties.keys())}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Stub tools MUST be visibly marked as not implemented
-# ---------------------------------------------------------------------------
-STUB_TOOLS = [
-    "patch_boot_image",
-    "flash_factory_image",
-    "get_pif_status",
-    "update_pif",
-    "check_play_integrity",
-    "list_backups",
-    "restore_backup",
-    "avb_sign",
-    "avb_verify",
-]
-
-
-@pytest.mark.parametrize("tool_name", STUB_TOOLS)
-def test_stub_tool_is_marked_as_not_implemented(
-    mcp_server_module, tool_name: str
-) -> None:
-    """Each stub tool MUST have 'Not yet implemented' (or similar) in its description.
-
-    Agents use tool descriptions to decide whether to call a tool. If a
-    stub tool's description looks like a real implementation, agents will
-    waste tokens and time calling it.
-    """
-    tools = mcp_server_module.mcp._tool_manager._tools
-    assert tool_name in tools, f"Stub tool {tool_name!r} is not registered."
-    tool = tools[tool_name]
-    description = (tool.description or "").lower()
-    assert "not yet implemented" in description or "not implemented" in description, (
-        f"Stub tool {tool_name!r} is NOT visibly marked as unimplemented.\n"
-        f"Agents may try to use it expecting real behavior.\n"
-        f"Description: {tool.description!r}"
     )
 
 

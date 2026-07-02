@@ -134,6 +134,7 @@ class BootPatchOutput(BaseModel):
     version: str | None = Field(default=None, description="Root solution version used")
     sha256: str | None = Field(default=None, description="SHA256 of patched image")
     dry_run: bool = Field(default=True, description="Whether this was a dry run")
+    warnings: list[str] = Field(default_factory=list, description="Non-fatal warnings")
 
 
 class FactoryFlashOutput(BaseModel):
@@ -163,6 +164,7 @@ class PifUpdateOutput(BaseModel):
     previous_hash: str | None = Field(default=None, description="SHA256 of previous pif.json")
     new_hash: str | None = Field(default=None, description="SHA256 of new pif.json")
     dry_run: bool = Field(default=True, description="Whether this was a dry run")
+    warnings: list[str] = Field(default_factory=list, description="Non-fatal warnings")
 
 
 class PlayIntegrityOutput(BaseModel):
@@ -171,6 +173,9 @@ class PlayIntegrityOutput(BaseModel):
     strong_integrity: bool | None = Field(default=None, description="Strong integrity verdict")
     timestamp: str | None = Field(default=None, description="ISO timestamp of the check")
     dry_run: bool = Field(default=True, description="Whether this was a dry run")
+    module_installed: bool = Field(default=False, description="Whether the PIF Magisk module is present")
+    module_enabled: bool = Field(default=False, description="Whether the PIF Magisk module is enabled")
+    module_version: str | None = Field(default=None, description="PIF module version from module.prop")
 
 
 class BackupOutput(BaseModel):
@@ -184,6 +189,8 @@ class BackupListEntry(BaseModel):
     sha1: str = Field(description="Backup SHA1 identifier")
     date: str | None = Field(default=None, description="Backup date")
     firmware: str | None = Field(default=None, description="Associated firmware")
+    name: str | None = Field(default=None, description="Backup file name")
+    size: int | None = Field(default=None, description="Backup file size in bytes")
 
 
 class BackupListOutput(BaseModel):
@@ -196,18 +203,23 @@ class BackupRestoreOutput(BaseModel):
     sha1: str | None = Field(default=None, description="Restored backup SHA1")
     firmware: str | None = Field(default=None, description="Associated firmware")
     dry_run: bool = Field(default=True, description="Whether this was a dry run")
+    warnings: list[str] = Field(default_factory=list, description="Non-fatal warnings")
 
 
 class AvbSignOutput(BaseModel):
     success: bool = Field(description="Whether the image was signed")
     signed_path: str | None = Field(default=None, description="Path to signed image")
     signature: str | None = Field(default=None, description="Signature hex or identifier")
+    warnings: list[str] = Field(default_factory=list, description="Non-fatal warnings")
 
 
 class AvbVerifyOutput(BaseModel):
     valid: bool = Field(description="Whether the AVB signature is valid")
     chain: list[str] = Field(default_factory=list, description="Verification chain details")
     warnings: list[str] = Field(default_factory=list, description="Non-fatal warnings")
+    algorithm: str | None = Field(default=None, description="AVB algorithm name")
+    hash: str | None = Field(default=None, description="Hash algorithm from descriptors")
+    error: str | None = Field(default=None, description="Verification error message")
 
 
 class RebootOutput(BaseModel):

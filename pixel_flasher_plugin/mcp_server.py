@@ -566,8 +566,34 @@ def patch_boot_image(
     dry_run: bool = True,
     confirm: bool = False,
 ) -> BootPatchOutput:
-    """Patch a boot image with Magisk, KernelSU, or APatch. (Not yet implemented — returns error)"""
-    return _not_implemented(BootPatchOutput)
+    """Validate and inspect a boot image for Magisk/KernelSU/APatch patching. CRITICAL operation.
+
+    Wave 1 implementation: this tool performs real validation (ANDROID! magic
+    header, size, and header metadata) but does NOT actually patch the image.
+    Full Magisk/KernelSU/APatch patching requires the patching binary from the
+    respective root solution and is deferred to a later wave or the
+    PixelFlasher GUI.
+
+    Defaults to dry_run=True (preview mode). To execute validation, pass
+    dry_run=False AND confirm=True.
+    """
+    ops = _ops(device_id, ctx)
+    if dry_run:
+        result = ops.patch_boot_image(boot_path, method=method, dry_run=True, confirm=False)
+        return _to_output(_as_preview(result), BootPatchOutput)
+    if not confirm:
+        return _refuse_confirm(BootPatchOutput, "CRITICAL")
+    result = ops.patch_boot_image(boot_path, method=method, dry_run=False, confirm=True)
+    return _to_output(
+        result,
+        BootPatchOutput,
+        data={
+            "success": result.success,
+            "patched_path": None,
+            "method": method,
+            "sha256": None,
+        },
+    )
 
 
 @mcp.tool()
@@ -579,8 +605,30 @@ def flash_factory_image(
     dry_run: bool = True,
     confirm: bool = False,
 ) -> FactoryFlashOutput:
-    """Flash a factory firmware image package to the device. (Not yet implemented — returns error)"""
-    return _not_implemented(FactoryFlashOutput)
+    """Inspect a factory firmware package; full flashing is safety-gated. CRITICAL operation.
+
+    Wave 1 implementation: in dry-run mode the zip is parsed and the list of
+    contained partition images is returned.  Executing a full factory flash is
+    the most destructive operation the agent could trigger, so even with
+    confirm=True it is refused and the user is directed to the PixelFlasher
+    GUI where device state can be supervised.
+
+    Defaults to dry_run=True (preview mode). To request execution, pass
+    dry_run=False AND confirm=True; the request will be refused with a clear
+    error.
+    """
+    ops = _ops(device_id, ctx)
+    if dry_run:
+        result = ops.flash_factory_image(
+            firmware_path, mode=mode, dry_run=True, confirm=False
+        )
+        return _to_output(_as_preview(result), FactoryFlashOutput)
+    if not confirm:
+        return _refuse_confirm(FactoryFlashOutput, "CRITICAL")
+    result = ops.flash_factory_image(
+        firmware_path, mode=mode, dry_run=False, confirm=True
+    )
+    return _to_output(result, FactoryFlashOutput)
 
 
 # ---------------------------------------------------------------------------
@@ -623,8 +671,9 @@ def capture_logcat(
 # ---------------------------------------------------------------------------
 @mcp.tool()
 def get_pif_status(ctx: Context, device_id: str) -> PifStatusOutput:
-    """Check whether a PIF (Play Integrity Fix) module is installed and read its JSON. (Not yet implemented — returns error)"""
-    return _not_implemented(PifStatusOutput)
+    """Read the Play Integrity Fix module's custom configuration and metadata."""
+    result = _ops(device_id, ctx).get_pif_status()
+    return _to_output(result, PifStatusOutput)
 
 
 @mcp.tool()
@@ -635,8 +684,15 @@ def update_pif(
     dry_run: bool = True,
     confirm: bool = False,
 ) -> PifUpdateOutput:
-    """Push a new pif.json to the device for the PIF module. (Not yet implemented — returns error)"""
-    return _not_implemented(PifUpdateOutput)
+    """Push a new pif.json to the device for the PIF module. WARN operation.
+
+    The supplied JSON is validated locally, pushed to a temporary path, and
+    then moved into place under root.  Root access is required for the final
+    copy/chmod step.  Pass confirm=True to execute.
+    """
+    ops = _ops(device_id, ctx)
+    result = ops.update_pif(pif_json, confirm=confirm)
+    return _to_output(result, PifUpdateOutput)
 
 
 @mcp.tool()
@@ -646,8 +702,15 @@ def check_play_integrity(
     dry_run: bool = True,
     confirm: bool = False,
 ) -> PlayIntegrityOutput:
-    """Run a Play Integrity API check on the device. (Not yet implemented — returns error)"""
-    return _not_implemented(PlayIntegrityOutput)
+    """Report the Play Integrity Fix module state on the device.
+
+    This tool does NOT invoke the Play Integrity API (that requires a device UI
+    and a calling app). It only reports whether the PIF Magisk module is
+    installed and enabled by reading module.prop and checking for the disable
+    file.
+    """
+    result = _ops(device_id, ctx).check_play_integrity()
+    return _to_output(result, PlayIntegrityOutput)
 
 
 # ---------------------------------------------------------------------------
@@ -674,20 +737,43 @@ def backup_partition(
 
 @mcp.tool()
 def list_backups(ctx: Context, device_id: str) -> BackupListOutput:
-    """List available Magisk boot backups for the device. (Not yet implemented — returns error)"""
-    return _not_implemented(BackupListOutput)
+    """List available Magisk boot backups on the device."""
+    result = _ops(device_id, ctx).list_backups()
+    return _to_output(result, BackupListOutput)
 
 
 @mcp.tool()
 def restore_backup(
     ctx: Context,
     device_id: str,
-    sha1: str,
+    backup_name: str,
     dry_run: bool = True,
     confirm: bool = False,
 ) -> BackupRestoreOutput:
-    """Restore a previously created boot backup. (Not yet implemented — returns error)"""
-    return _not_implemented(BackupRestoreOutput)
+    """Restore a previously created boot backup. CRITICAL operation.
+
+    The backup is pulled from /data/adb/magisk_backup/<backup_name> and then
+    flashed to the boot partition, reusing the same backup + rollback safety
+    as flash_partition.
+
+    Defaults to dry_run=True (preview mode).  To execute, pass dry_run=False
+    AND confirm=True.
+    """
+    ops = _ops(device_id, ctx)
+    if dry_run:
+        result = ops.restore_backup(backup_name, dry_run=True, confirm=False)
+        return _to_output(_as_preview(result), BackupRestoreOutput)
+    if not confirm:
+        return _refuse_confirm(BackupRestoreOutput, "CRITICAL")
+    result = ops.restore_backup(backup_name, dry_run=False, confirm=True)
+    return _to_output(
+        result,
+        BackupRestoreOutput,
+        data={
+            "success": result.success,
+            "sha1": backup_name,
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -699,15 +785,27 @@ def avb_sign(
     image_path: str,
     key_path: str,
     algorithm: str = "SHA256_RSA4096",
+    confirm: bool = False,
 ) -> AvbSignOutput:
-    """Sign an image with an AVB key. (Not yet implemented — returns error)"""
-    return _not_implemented(AvbSignOutput)
+    """Sign a local image with an AVB key. WARN operation.
+
+    Uses avbtool to add a hash footer to a copy of the image.  The original
+    image is not modified; the signed copy is written next to it.  Pass
+    confirm=True to execute.
+    """
+    if not confirm:
+        return _refuse_confirm(AvbSignOutput, "WARN")
+    ops: DeviceOps = ctx.request_context.lifespan_context.device_ops
+    result = ops.avb_sign_image(image_path, key_path, algorithm=algorithm, confirm=True)
+    return _to_output(result, AvbSignOutput)
 
 
 @mcp.tool()
 def avb_verify(ctx: Context, image_path: str) -> AvbVerifyOutput:
-    """Verify the AVB signature of an image. (Not yet implemented — returns error)"""
-    return _not_implemented(AvbVerifyOutput)
+    """Verify the AVB signature of a local image using avbtool."""
+    ops: DeviceOps = ctx.request_context.lifespan_context.device_ops
+    result = ops.avb_verify_image(image_path)
+    return _to_output(result, AvbVerifyOutput)
 
 
 # ---------------------------------------------------------------------------

@@ -6,10 +6,14 @@ is routed through :class:`SafetyGateway` before execution.
 """
 from __future__ import annotations
 
+import fnmatch
 import hashlib
+import io
+import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import tempfile
 from typing import Any, ClassVar
@@ -603,6 +607,176 @@ class DeviceOps:
                 except Exception:
                     pass
 
+    def patch_boot_image(
+        self,
+        boot_path: str,
+        method: str = "Magisk",
+        dry_run: bool = True,
+        confirm: bool = False,
+    ) -> ToolResult:
+        """Validate and inspect a boot image for patching.
+
+        Wave 1 implementation: this tool performs real validation (ANDROID!
+        magic header, size, and header metadata) but does NOT actually patch
+        the image.  Full Magisk/KernelSU/APatch patching requires the patching
+        binary from the respective root solution and is deferred to a later
+        wave or the PixelFlasher GUI.
+        """
+        resolved = os.path.abspath(os.path.expanduser(boot_path))
+        if not os.path.isfile(resolved):
+            return ToolResult(
+                success=False,
+                error=f"Boot image not found: {resolved}",
+            )
+
+        try:
+            with open(resolved, "rb") as f:
+                header = f.read(44)
+        except Exception as exc:
+            return ToolResult(
+                success=False,
+                error=f"Failed to read boot image: {exc}",
+            )
+
+        if len(header) < 8 or header[:8] != b"ANDROID!":
+            return ToolResult(
+                success=False,
+                error=f"Invalid boot image: missing ANDROID! magic header in {resolved}",
+            )
+
+        try:
+            import struct
+            (
+                kernel_size,
+                kernel_addr,
+                ramdisk_size,
+                ramdisk_addr,
+                second_size,
+                second_addr,
+                tags_addr,
+                page_size,
+            ) = struct.unpack("<IIIIIIII", header[8:40])
+            header_version = struct.unpack("<I", header[40:44])[0]
+        except Exception as exc:
+            return ToolResult(
+                success=False,
+                error=f"Failed to parse boot image header: {exc}",
+            )
+
+        metadata = {
+            "image_path": resolved,
+            "magic_valid": True,
+            "file_size": os.path.getsize(resolved),
+            "kernel_size": kernel_size,
+            "kernel_addr": kernel_addr,
+            "ramdisk_size": ramdisk_size,
+            "ramdisk_addr": ramdisk_addr,
+            "second_size": second_size,
+            "second_addr": second_addr,
+            "tags_addr": tags_addr,
+            "page_size": page_size,
+            "header_version": header_version,
+            "method": method,
+        }
+
+        deferred_warning = (
+            "Actual Magisk/KernelSU/APatch patching is not yet implemented; "
+            "this tool currently validates and inspects the boot image only."
+        )
+
+        if dry_run:
+            return ToolResult(
+                success=True,
+                dry_run=True,
+                data=metadata,
+                warnings=["Dry run - no changes made", deferred_warning],
+            )
+
+        if not confirm:
+            return ToolResult(
+                success=False,
+                error="CRITICAL operation requires confirm=True",
+            )
+
+        # confirm=True, but patching itself is still deferred.
+        return ToolResult(
+            success=True,
+            dry_run=False,
+            data=metadata,
+            warnings=[deferred_warning],
+        )
+
+    def flash_factory_image(
+        self,
+        firmware_path: str,
+        mode: str = "dryRun",
+        dry_run: bool = True,
+        confirm: bool = False,
+    ) -> ToolResult:
+        """Inspect a factory image zip; full flashing is safety-gated.
+
+        Wave 1 implementation: in dry-run mode the zip is parsed and the list of
+        contained partition images is returned.  Executing a full factory flash
+        is the most destructive operation the agent could trigger, so even with
+        confirm=True it is refused and the user is directed to the PixelFlasher
+        GUI where device state can be supervised.
+        """
+        resolved = os.path.abspath(os.path.expanduser(firmware_path))
+        if not os.path.isfile(resolved):
+            return ToolResult(
+                success=False,
+                error=f"Factory image zip not found: {resolved}",
+            )
+
+        try:
+            import zipfile
+            with zipfile.ZipFile(resolved, "r") as zf:
+                namelist = zf.namelist()
+        except Exception as exc:
+            return ToolResult(
+                success=False,
+                error=f"Failed to open factory zip: {exc}",
+            )
+
+        image_files = [n for n in namelist if n.lower().endswith(".img")]
+        partitions = []
+        for name in image_files:
+            base = os.path.basename(name)
+            part, _ = os.path.splitext(base)
+            partitions.append({"file": name, "partition": part})
+
+        safety_warning = (
+            "Full factory image flashing is the most destructive operation and "
+            "is not supported via the MCP agent in this release."
+        )
+
+        if dry_run:
+            return ToolResult(
+                success=True,
+                dry_run=True,
+                data={
+                    "mode": mode,
+                    "factory_zip": resolved,
+                    "image_files": image_files,
+                    "partitions": partitions,
+                },
+                warnings=[safety_warning],
+            )
+
+        if not confirm:
+            return ToolResult(
+                success=False,
+                error="CRITICAL operation requires confirm=True",
+            )
+
+        return ToolResult(
+            success=False,
+            error=(
+                "Full factory image flashing is not supported via the MCP agent. "
+                "Please use the PixelFlasher GUI for this operation."
+            ),
+        )
+
     def wipe_partition(self, partition: str, confirm: bool = False) -> ToolResult:
         """Erase a partition via fastboot."""
         try:
@@ -1030,6 +1204,492 @@ class DeviceOps:
         except Exception as exc:
             self._log("run_shell", command if "command" in dir() else None, False)
             return self._tool_error("run_shell", exc, command)
+
+    # ------------------------------------------------------------------
+    # PIF / Play Integrity (read-only)
+    # ------------------------------------------------------------------
+    def _read_module_prop(self) -> dict[str, str]:
+        """Read /data/adb/modules/playintegrityfix/module.prop into a dict."""
+        path = "/data/adb/modules/playintegrityfix/module.prop"
+        subcommand = f"shell cat {self._q(path)}"
+        command = self._adb_cmd(subcommand)
+        blocked = self._evaluate(command, RiskTier.INFO, confirm=False)
+        if blocked:
+            return {}
+        exec_cmd = self._exec_adb_cmd(subcommand)
+        res = self._run_shell_safe(exec_cmd, timeout=30)
+        if res.returncode != 0:
+            return {}
+        props: dict[str, str] = {}
+        for line in res.stdout.splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                props[key.strip()] = value.strip()
+        return props
+
+    def get_pif_status(self) -> ToolResult:
+        """Read the PIF module's custom configuration and module metadata."""
+        try:
+            module_dir = "/data/adb/modules/playintegrityfix"
+            json_path = f"{module_dir}/custom.pif.json"
+            prop_path = f"{module_dir}/custom.pif.prop"
+
+            module_prop = self._read_module_prop()
+            module_installed = bool(module_prop)
+            module_name = module_prop.get("name")
+            module_version = module_prop.get("version")
+
+            # Try JSON config first.
+            for pif_path in (json_path, prop_path):
+                subcommand = f"shell cat {self._q(pif_path)}"
+                command = self._adb_cmd(subcommand)
+                blocked = self._evaluate(command, RiskTier.INFO, confirm=False)
+                if blocked:
+                    return ToolResult(
+                        success=False,
+                        error=blocked.error or "PIF read blocked by safety gateway",
+                        command=command,
+                    )
+                exec_cmd = self._exec_adb_cmd(subcommand)
+                res = self._run_shell_safe(exec_cmd, timeout=30)
+                if res.returncode != 0 or not res.stdout.strip():
+                    continue
+
+                content: dict[str, Any] | str
+                if pif_path.endswith(".json"):
+                    try:
+                        content = json.loads(res.stdout)
+                    except json.JSONDecodeError as exc:
+                        content = {"raw": res.stdout, "parse_error": str(exc)}
+                else:
+                    props: dict[str, str] = {}
+                    for line in res.stdout.splitlines():
+                        if "=" in line:
+                            key, value = line.split("=", 1)
+                            props[key.strip()] = value.strip()
+                    content = props
+
+                self._log("get_pif_status", command, True)
+                return ToolResult(
+                    success=True,
+                    data={
+                        "pif_exists": True,
+                        "pif_path": pif_path,
+                        "pif_content": content,
+                        "module_name": module_name,
+                        "module_version": module_version,
+                        "module_installed": module_installed,
+                    },
+                )
+
+            self._log("get_pif_status", None, True)
+            return ToolResult(
+                success=True,
+                data={
+                    "pif_exists": False,
+                    "pif_path": None,
+                    "pif_content": None,
+                    "module_name": module_name,
+                    "module_version": module_version,
+                    "module_installed": module_installed,
+                },
+            )
+        except Exception as exc:
+            self._log("get_pif_status", None, False)
+            return self._tool_error("get_pif_status", exc)
+
+    def check_play_integrity(self) -> ToolResult:
+        """Report the PIF Magisk module state.
+
+        This does NOT invoke the Play Integrity API (that requires a device UI
+        and a calling app). It only reports whether the PIF module is installed
+        and enabled on the device.
+        """
+        try:
+            module_dir = "/data/adb/modules/playintegrityfix"
+            module_prop = self._read_module_prop()
+            module_installed = bool(module_prop)
+            module_version = module_prop.get("version")
+
+            disable_path = f"{module_dir}/disable"
+            subcommand = f"shell ls {self._q(disable_path)}"
+            command = self._adb_cmd(subcommand)
+            blocked = self._evaluate(command, RiskTier.INFO, confirm=False)
+            if blocked:
+                return ToolResult(
+                    success=False,
+                    error=blocked.error or "PIF disable check blocked by safety gateway",
+                    command=command,
+                )
+            exec_cmd = self._exec_adb_cmd(subcommand)
+            res = self._run_shell_safe(exec_cmd, timeout=30)
+            # If the disable file exists, the module is disabled.
+            module_enabled = module_installed and res.returncode != 0
+
+            self._log("check_play_integrity", command, True)
+            return ToolResult(
+                success=True,
+                data={
+                    "module_installed": module_installed,
+                    "module_enabled": module_enabled,
+                    "module_version": module_version,
+                    "module_name": module_prop.get("name"),
+                },
+            )
+        except Exception as exc:
+            self._log("check_play_integrity", None, False)
+            return self._tool_error("check_play_integrity", exc)
+
+    def update_pif(self, pif_json: str | dict, confirm: bool = False) -> ToolResult:
+        """Push a new PIF config to the device.
+
+        The JSON is validated locally, pushed to a temporary location, and then
+        moved into place under root.  Root access is required for the final
+        copy/chmod step.
+        """
+        try:
+            if isinstance(pif_json, dict):
+                json_bytes = json.dumps(pif_json, indent=2).encode("utf-8")
+            else:
+                # Validate by parsing, then preserve the original serialization.
+                json.loads(pif_json)
+                json_bytes = pif_json.encode("utf-8")
+        except Exception as exc:
+            return ToolResult(success=False, error=f"Invalid pif_json: {exc}")
+
+        new_hash = hashlib.sha256(json_bytes).hexdigest()
+        fd, local_tmp = tempfile.mkstemp(prefix="pif_", suffix=".json")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(json_bytes)
+        except Exception as exc:
+            return ToolResult(success=False, error=f"Failed to write temp file: {exc}")
+
+        remote_tmp = "/data/local/tmp/custom.pif.json"
+        final_path = "/data/adb/modules/playintegrityfix/custom.pif.json"
+
+        try:
+            # Push the validated config to a temporary device path.
+            push_cmd = self._adb_cmd(f"push {self._q(local_tmp)} {self._q(remote_tmp)}")
+            blocked = self._evaluate(push_cmd, RiskTier.WARN, confirm)
+            if blocked:
+                self._log("update_pif", push_cmd, False)
+                return blocked
+
+            preflight = self._run_preflight(RiskTier.WARN, expected_mode="adb")
+            if preflight:
+                self._log("update_pif", push_cmd, False)
+                return preflight
+
+            exec_cmd = self._exec_adb_cmd(f"push {self._q(local_tmp)} {self._q(remote_tmp)}")
+            res = self._run_shell_safe(exec_cmd, timeout=60)
+            if res.returncode != 0:
+                self._log("update_pif", push_cmd, False)
+                return ToolResult(
+                    success=False,
+                    error=f"push failed (exit {res.returncode}): {res.stderr}",
+                    command=push_cmd,
+                )
+
+            # Move into place as root and fix permissions.
+            su_cmd = self._adb_cmd(
+                f'shell su -c "cp {self._q(remote_tmp)} {self._q(final_path)} '
+                f'&& chmod 644 {self._q(final_path)}"'
+            )
+            blocked = self._evaluate(su_cmd, RiskTier.WARN, confirm)
+            if blocked:
+                self._log("update_pif", su_cmd, False)
+                return blocked
+
+            exec_cmd = self._exec_adb_cmd(
+                f'shell su -c "cp {self._q(remote_tmp)} {self._q(final_path)} '
+                f'&& chmod 644 {self._q(final_path)}"'
+            )
+            res = self._run_shell_safe(exec_cmd, timeout=60)
+            if res.returncode != 0:
+                self._log("update_pif", su_cmd, False)
+                return ToolResult(
+                    success=False,
+                    error=(
+                        f"su copy failed (exit {res.returncode}): {res.stderr}; "
+                        "root is required to install the PIF config"
+                    ),
+                    command=su_cmd,
+                )
+
+            self._log("update_pif", su_cmd, True)
+            return ToolResult(
+                success=True,
+                data={
+                    "new_hash": new_hash,
+                    "pif_path": final_path,
+                    "previous_hash": None,
+                },
+                command=su_cmd,
+            )
+        except Exception as exc:
+            self._log("update_pif", None, False)
+            return self._tool_error("update_pif", exc)
+        finally:
+            try:
+                os.remove(local_tmp)
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # Backup listing (read-only)
+    # ------------------------------------------------------------------
+    def list_backups(self) -> ToolResult:
+        """List boot backup files in /data/adb/magisk_backup/."""
+        backup_dir = "/data/adb/magisk_backup"
+        subcommand = f"shell ls -la {self._q(backup_dir)}"
+        command = self._adb_cmd(subcommand)
+        blocked = self._evaluate(command, RiskTier.INFO, confirm=False)
+        if blocked:
+            return ToolResult(
+                success=False,
+                error=blocked.error or "Backup listing blocked by safety gateway",
+                command=command,
+            )
+        exec_cmd = self._exec_adb_cmd(subcommand)
+        res = self._run_shell_safe(exec_cmd, timeout=30)
+        if res.returncode != 0:
+            # Directory likely does not exist; this is not an error for callers.
+            return ToolResult(success=True, data={"backups": [], "count": 0})
+
+        backups: list[dict[str, Any]] = []
+        for line in res.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 8:
+                continue
+            name = parts[-1]
+            if name in (".", ".."):
+                continue
+            if not (fnmatch.fnmatch(name, "boot_*.img") or fnmatch.fnmatch(name, "*.img.gz")):
+                continue
+            try:
+                size = int(parts[4])
+            except ValueError:
+                size = None
+            date = f"{parts[5]} {parts[6]}"
+            backups.append(
+                {
+                    "sha1": name,
+                    "date": date,
+                    "firmware": None,
+                    "name": name,
+                    "size": size,
+                }
+            )
+
+        self._log("list_backups", command, True)
+        return ToolResult(success=True, data={"backups": backups, "count": len(backups)})
+
+    def restore_backup(
+        self,
+        backup_name: str,
+        dry_run: bool = True,
+        confirm: bool = False,
+    ) -> ToolResult:
+        """Restore a previously-created boot backup.
+
+        The backup is pulled from the device and then flashed to the boot
+        partition via :meth:`flash_partition`, which provides the same backup
+        and rollback safety as a normal boot flash.
+        """
+        if not re.match(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$", backup_name):
+            return ToolResult(
+                success=False,
+                error=f"Invalid backup name: {backup_name}",
+            )
+
+        remote_path = f"/data/adb/magisk_backup/{backup_name}"
+
+        if dry_run:
+            command = self._adb_cmd(f"pull {self._q(remote_path)} <local_tmp>")
+            return ToolResult(
+                success=True,
+                dry_run=True,
+                data={
+                    "backup_name": backup_name,
+                    "remote_path": remote_path,
+                    "partition": "boot",
+                },
+                command=command,
+                warnings=["Dry run - no changes made"],
+            )
+
+        local_fd, local_tmp = tempfile.mkstemp(prefix="backup_", suffix=".img")
+        os.close(local_fd)
+        try:
+            pull_result = self.pull_file(remote_path, local_tmp, confirm=False)
+            if not pull_result.success:
+                return pull_result
+            local_path = (pull_result.data or {}).get("local_path", local_tmp)
+            return self.flash_partition("boot", local_path, confirm=confirm)
+        finally:
+            if os.path.exists(local_tmp):
+                try:
+                    os.remove(local_tmp)
+                except Exception:
+                    pass
+
+    # ------------------------------------------------------------------
+    # AVB verification / signing (host-side)
+    # ------------------------------------------------------------------
+    def avb_sign_image(
+        self,
+        image_path: str,
+        key_path: str,
+        algorithm: str = "SHA256_RSA4096",
+        confirm: bool = False,
+    ) -> ToolResult:
+        """Sign a local image using avbtool.
+
+        The input image is copied to ``<image>.signed.img`` and a hash footer is
+        added with the supplied key and algorithm.  This is a host-side operation;
+        it does not touch the device.
+        """
+        resolved = os.path.abspath(os.path.expanduser(image_path))
+        key_resolved = os.path.abspath(os.path.expanduser(key_path))
+
+        if not os.path.isfile(resolved):
+            return ToolResult(
+                success=False,
+                error=f"Image file not found: {resolved}",
+            )
+        if not os.path.isfile(key_resolved):
+            return ToolResult(
+                success=False,
+                error=f"Key file not found: {key_resolved}",
+            )
+
+        base, ext = os.path.splitext(resolved)
+        signed_path = f"{base}.signed{ext}"
+        partition_name = os.path.basename(base)
+
+        command = (
+            f"avbtool add_hash_footer --image {self._q(resolved)} "
+            f"--dynamic_partition_size --partition_name {self._q(partition_name)} "
+            f"--hash_algorithm sha256 --algorithm {self._q(algorithm)} "
+            f"--key {self._q(key_resolved)}"
+        )
+        blocked = self._evaluate(command, RiskTier.WARN, confirm)
+        if blocked:
+            self._log("avb_sign_image", command, False)
+            return blocked
+
+        try:
+            import avbtool
+        except Exception as exc:
+            return ToolResult(
+                success=False,
+                error=f"Could not import avbtool: {exc}",
+            )
+
+        try:
+            shutil.copy2(resolved, signed_path)
+            tool = avbtool.AvbTool()
+            tool.add_hash_footer(
+                image_filename=signed_path,
+                partition_size=0,
+                dynamic_partition_size=True,
+                partition_name=partition_name,
+                hash_algorithm="sha256",
+                salt=None,
+                chain_partitions_use_ab=None,
+                chain_partitions_do_not_use_ab=None,
+                algorithm_name=algorithm,
+                key_path=key_resolved,
+                public_key_metadata_path=None,
+                rollback_index=0,
+                flags=0,
+                rollback_index_location=0,
+                props=None,
+                props_from_file=None,
+                kernel_cmdlines=None,
+                setup_rootfs_from_kernel=None,
+                include_descriptors_from_image=None,
+                calc_max_image_size=False,
+                signing_helper=None,
+                signing_helper_with_files=None,
+                release_string=None,
+                append_to_release_string=None,
+                output_vbmeta_image=None,
+                do_not_append_vbmeta_image=False,
+                print_required_libavb_version=False,
+                use_persistent_digest=False,
+                do_not_use_ab=False,
+            )
+            self._log("avb_sign_image", command, True)
+            return ToolResult(
+                success=True,
+                data={"signed_path": signed_path, "algorithm": algorithm},
+                command=command,
+            )
+        except avbtool.AvbError as exc:
+            self._log("avb_sign_image", command, False)
+            return ToolResult(
+                success=False,
+                error=f"avbtool error: {exc}",
+                command=command,
+            )
+        except Exception as exc:
+            self._log("avb_sign_image", command, False)
+            return ToolResult(
+                success=False,
+                error=f"AVB signing failed: {exc}",
+                command=command,
+            )
+
+    def avb_verify_image(self, image_path: str) -> ToolResult:
+        """Verify the AVB signature of a local image using avbtool."""
+        resolved = os.path.abspath(os.path.expanduser(image_path))
+        if not os.path.isfile(resolved):
+            return ToolResult(
+                success=False,
+                error=f"Image file not found: {resolved}",
+            )
+
+        try:
+            import avbtool
+        except Exception as exc:
+            return ToolResult(
+                success=False,
+                error=f"Could not import avbtool: {exc}",
+            )
+
+        try:
+            tool = avbtool.AvbTool()
+            output = io.StringIO()
+            info = tool.info_image(resolved, output, atx=False) or {}
+            algorithm = info.get("Algorithm")
+            hash_alg = info.get("Hash Algorithm")
+
+            try:
+                tool.verify_image(resolved, None, None, False, False)
+                valid = True
+                error = None
+            except avbtool.AvbError as exc:
+                valid = False
+                error = str(exc)
+
+            return ToolResult(
+                success=True,
+                data={
+                    "valid": valid,
+                    "algorithm": algorithm,
+                    "hash": hash_alg,
+                    "chain": [],
+                    "warnings": [],
+                    "error": error,
+                },
+            )
+        except Exception as exc:
+            return ToolResult(
+                success=False,
+                error=f"AVB verification failed: {exc}",
+            )
 
 
 __all__ = ["DeviceOps"]
