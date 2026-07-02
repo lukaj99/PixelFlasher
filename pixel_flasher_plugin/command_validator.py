@@ -25,6 +25,11 @@ class CommandValidator:
         # Host-side redirect used by read_partition; partition is sanitized before
         # this pattern is reached.
         re.compile(r"^adb\s+-s\s+\S+\s+shell\s+cat\s+\S+\s*>\s*\S+$"),
+        # PIF update: copy temp config into place under root and fix permissions.
+        re.compile(
+            r"^adb\s+-s\s+\S+\s+shell\s+su\s+-c\s+"
+            r"\"cp\s+\S+\s+\S+\s+&&\s+chmod\s+\d+\s+\S+\"$"
+        ),
     ]
 
     ALLOWED_FASTBOOT_COMMANDS = [
