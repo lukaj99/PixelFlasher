@@ -3,10 +3,6 @@ from __future__ import annotations
 
 import re
 
-# constants.py lives in the parent project directory. When the MCP server runs from
-# the project root, `import constants` resolves correctly.
-import constants  # type: ignore[import-not-found]
-
 
 class CommandValidator:
     ALLOWED_ADB_COMMANDS = [

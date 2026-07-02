@@ -6,6 +6,14 @@ import sys
 import types
 from typing import TYPE_CHECKING
 
+# Make the package self-locating: phone.py, runtime.py, config.py, constants.py
+# live at the repo root (the parent GUI app's core), not inside this package.
+# Inject the repo root into sys.path so imports resolve regardless of CWD —
+# MCP clients launch the server from their own working directory.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 if TYPE_CHECKING:
     from config import Config
     from phone import Device
