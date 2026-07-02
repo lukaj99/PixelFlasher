@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pixelflasher-mcp"
+version = "9.1.1.2"
+description = "Headless MCP server for PixelFlasher device operations"
+readme = "README.md"
+license = {text = "AGPL-3.0-or-later"}
+requires-python = ">=3.9"
+dependencies = [
+    "mcp>=1.0",
+    "pydantic>=2.0",
+]
+
+[project.scripts]
+pixelflasher-mcp = "pixel_flasher_plugin.mcp_server:main"
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pixel_flasher_plugin*"]
+exclude = ["pixel_flasher_plugin.tests*"]

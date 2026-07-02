@@ -4,10 +4,27 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import sys
 import time
 from contextlib import contextmanager
 from typing import Any
+
+
+_DEFAULT_LEVEL = logging.INFO
+
+
+def _resolve_level() -> int:
+    """Resolve log level from PF_LOG_LEVEL env var, defaulting to INFO."""
+    raw = os.environ.get("PF_LOG_LEVEL")
+    if not raw:
+        return _DEFAULT_LEVEL
+    if raw.isdigit():
+        return int(raw)
+    level = getattr(logging, raw.upper(), None)
+    if isinstance(level, int):
+        return level
+    return _DEFAULT_LEVEL
 
 
 class _JsonFormatter(logging.Formatter):
@@ -55,7 +72,7 @@ class _JsonFormatter(logging.Formatter):
 def get_logger(name: str) -> logging.Logger:
     """Return a logger that writes JSON lines to stderr (stdout is MCP protocol)."""
     logger = logging.getLogger(name)
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(_resolve_level())
     # Avoid adding multiple handlers if the logger is already configured.
     if not any(isinstance(h, logging.StreamHandler) and h.stream is sys.stderr for h in logger.handlers):
         handler = logging.StreamHandler(sys.stderr)
@@ -101,4 +118,4 @@ def log_audit(
     else:
         entry["device_id_hash"] = None
     entry.update(extra)
-    logger.info("audit", **entry)
+    logger.info("audit", extra=entry)

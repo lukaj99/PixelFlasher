@@ -69,11 +69,22 @@ def _install_wx_stub() -> None:
 
             return _Size()
 
+    _stub_cache: dict[str, type] = {}
+
+    def _make_stub_class(name: str) -> type:
+        # Create (or reuse) a _StubWxBase subclass for any unstubbed wx attribute.
+        # It's instantiable, callable, and usable as a base class, so module-scope
+        # inheritance like `class Foo(wx.Panel):` doesn't raise TypeError.
+        if name not in _stub_cache:
+            cls = type(name, (_StubWxBase,), {})
+            _stub_cache[name] = cls
+        return _stub_cache[name]
+
     class _WxStub(types.ModuleType):
         """Module subclass that provides a catch-all __getattr__ fallback."""
 
         def __getattr__(self, name: str) -> object:
-            return None
+            return _make_stub_class(name)
 
     stub = _WxStub("wx")
     stub._pf_stub = True
