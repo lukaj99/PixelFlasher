@@ -124,7 +124,111 @@ def test_legit_command_is_allowed(cmd: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Firmware-critical partitions -- is_partition_blocked() MUST return True
+# New command shapes for the three real-hardware bug fixes
+# ---------------------------------------------------------------------------
+NEW_COMMAND_SHAPES = [
+    pytest.param(
+        "adb -s '100.123.230.67:5555' shell getprop 'ro.build.fingerprint'",
+        id="quoted-getprop-network-serial",
+    ),
+    pytest.param(
+        "adb -s '100.123.230.67:5555' shell su -c \"blockdev --getsize64 '/dev/block/by-name/boot'\"",
+        id="blockdev-by-name-quoted",
+    ),
+    pytest.param(
+        "adb -s '100.123.230.67:5555' shell ls -l '/dev/block/by-name/boot'",
+        id="ls-l-by-name-quoted",
+    ),
+    pytest.param(
+        "adb -s '100.123.230.67:5555' shell mount",
+        id="mount",
+    ),
+    pytest.param(
+        "adb -s '100.123.230.67:5555' shell pm list packages",
+        id="pm-list-packages-bare",
+    ),
+    pytest.param(
+        "adb -s '100.123.230.67:5555' shell pm list packages -3",
+        id="pm-list-packages-3",
+    ),
+    pytest.param(
+        "adb -s '100.123.230.67:5555' shell pm list packages -s",
+        id="pm-list-packages-s",
+    ),
+    pytest.param(
+        "adb -s '100.123.230.67:5555' shell pm list packages -e",
+        id="pm-list-packages-e",
+    ),
+    pytest.param(
+        "adb -s '100.123.230.67:5555' shell pm list packages -d",
+        id="pm-list-packages-d",
+    ),
+    pytest.param(
+        "adb -s '100.123.230.67:5555' shell pm list packages -u",
+        id="pm-list-packages-u",
+    ),
+]
+
+
+@pytest.mark.parametrize("cmd", NEW_COMMAND_SHAPES)
+def test_new_command_shape_is_allowed(cmd: str) -> None:
+    """Every command shape used by the three bug fixes must pass the whitelist."""
+    allowed, reason = CommandValidator.is_allowed(cmd)
+    assert allowed is True, f"NEW COMMAND BLOCKED: {cmd!r}\nReason: {reason!r}"
+    assert reason == "", f"Reason should be empty for allowed command, got {reason!r}"
+
+
+# ---------------------------------------------------------------------------
+# Injection vectors for the three bug-fix paths
+# ---------------------------------------------------------------------------
+BUGFIX_INJECTION_VECTORS = [
+    pytest.param(
+        "adb -s X shell getprop ro.x; rm -rf /",
+        id="prop-semicolon-chain",
+    ),
+    pytest.param(
+        "adb -s X shell getprop ro.x | cat",
+        id="prop-pipe",
+    ),
+    pytest.param(
+        "adb -s X shell getprop ro.x\nrm -rf /",
+        id="prop-newline-chain",
+    ),
+    pytest.param(
+        "adb -s X shell ls -l /dev/block/by-name/boot; rm -rf /",
+        id="partition-ls-semicolon",
+    ),
+    pytest.param(
+        "adb -s X shell ls -l /dev/block/by-name/boot | cat",
+        id="partition-ls-pipe",
+    ),
+    pytest.param(
+        "adb -s X shell mount; rm -rf /",
+        id="mount-semicolon",
+    ),
+    pytest.param(
+        "adb -s X shell pm list packages; rm -rf /",
+        id="pm-list-semicolon",
+    ),
+    pytest.param(
+        "adb -s X shell pm list packages -3; rm -rf /",
+        id="pm-list-flag-semicolon",
+    ),
+]
+
+
+@pytest.mark.parametrize("cmd", BUGFIX_INJECTION_VECTORS)
+def test_bugfix_injection_vector_is_blocked(cmd: str) -> None:
+    """Shell metacharacters on the three fixed paths must still be denied."""
+    allowed, reason = CommandValidator.is_allowed(cmd)
+    assert allowed is False, (
+        f"INJECTION VECTOR ALLOWED: {cmd!r}\n"
+        f"This command would let an agent chain arbitrary shell commands."
+    )
+    assert reason, f"Denial reason is empty for {cmd!r}"
+    assert "whitelist" in reason.lower() or "blocked" in reason.lower(), (
+        f"Unexpected denial reason for {cmd!r}: {reason!r}"
+    )
 # ---------------------------------------------------------------------------
 # The reviewer-validated blocklist covers 17 partitions. Every partition that
 # can brick the device if flashed/erased must appear here (slot suffix stripped

@@ -218,14 +218,12 @@ def get_device_info(ctx: Context, device_id: str) -> DeviceInfoOutput:
 @mcp.tool()
 def get_device_prop(ctx: Context, device_id: str, prop: str) -> PropOutput:
     """Read a single Android system property via getprop."""
-    result = _ops(device_id, ctx).run_shell(
-        f"adb -s {device_id} shell getprop {prop}",
-        confirm=False,
+    result = _ops(device_id, ctx).get_device_prop(prop)
+    return _to_output(
+        result,
+        PropOutput,
+        data={"prop": prop, "value": (result.data or {}).get("value")} if result.success else None,
     )
-    if result.success:
-        stdout = (result.data or {}).get("stdout", "").strip() or None
-        return PropOutput(prop=prop, value=stdout)
-    return _to_output(result, PropOutput)
 
 
 @mcp.tool()
@@ -260,17 +258,9 @@ def list_packages(
     search: str | None = None,
 ) -> PackageListOutput:
     """List installed packages, optionally filtered by type or name substring."""
-    result = _ops(device_id, ctx).run_shell(
-        f"adb -s {device_id} shell pm list packages {shlex.quote(filter)}",
-        confirm=False,
-    )
+    result = _ops(device_id, ctx).list_packages(filter=filter)
     if result.success:
-        stdout = (result.data or {}).get("stdout", "")
-        names = [
-            line.strip().replace("package:", "")
-            for line in stdout.splitlines()
-            if line.strip().startswith("package:")
-        ]
+        names = (result.data or {}).get("packages", [])
         if search:
             names = [n for n in names if search.lower() in n.lower()]
         entries = [PackageListEntry(name=n, installed=True) for n in names]
@@ -415,7 +405,15 @@ def get_partitions(ctx: Context, device_id: str) -> PartitionListOutput:
     result = _ops(device_id, ctx).list_partitions()
     if result.success:
         raw = (result.data or {}).get("partitions", [])
-        entries = [PartitionEntry(name=item.get("name", "")) for item in raw]
+        entries = []
+        for item in raw:
+            fields = {
+                k: item.get(k)
+                for k in ("name", "size", "type", "fs_type", "mount_point")
+                if item.get(k) is not None
+            }
+            fields.setdefault("name", item.get("name", ""))
+            entries.append(PartitionEntry(**fields))
         return PartitionListOutput(partitions=entries, count=len(entries))
     return _to_output(result, PartitionListOutput)
 

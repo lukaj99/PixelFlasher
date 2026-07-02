@@ -34,6 +34,8 @@ class DeviceInfoOutput(BaseModel):
 class PropOutput(BaseModel):
     prop: str = Field(description="Property name queried")
     value: str | None = Field(default=None, description="Property value")
+    success: bool = Field(default=True, description="Whether the query succeeded")
+    error: str | None = Field(default=None, description="Error message if success=False")
 
 
 class WaitOutput(BaseModel):

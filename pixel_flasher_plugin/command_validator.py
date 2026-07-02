@@ -8,7 +8,7 @@ class CommandValidator:
     ALLOWED_ADB_COMMANDS = [
         re.compile(r"^adb\s+devices(-l)?$"),
         re.compile(r"^adb\s+-s\s+\S+\s+shell\s+getprop\s+\S+$"),
-        re.compile(r"^adb\s+-s\s+\S+\s+shell\s+pm\s+list\s+packages(-\S+)?$"),
+        re.compile(r"^adb\s+-s\s+\S+\s+shell\s+pm\s+list\s+packages(\s+-[3sedu])?$"),
         re.compile(r"^adb\s+-s\s+\S+\s+shell\s+pm\s+path\s+\S+$"),
         re.compile(r"^adb\s+-s\s+\S+\s+shell\s+pm\s+(enable|disable)\s+\S+$"),
         re.compile(r"^adb\s+-s\s+\S+\s+shell\s+pm\s+(grant|revoke)\s+\S+\s+\S+$"),
@@ -16,7 +16,9 @@ class CommandValidator:
         re.compile(r"^adb\s+-s\s+\S+\s+shell\s+logcat(\s+\S+)*$"),
         re.compile(r"^adb\s+-s\s+\S+\s+shell\s+su\s+-c\s+\"blockdev\s+--getsize64\s+\S+\"$"),
         re.compile(r"^adb\s+-s\s+\S+\s+shell\s+su\s+-c\s+\"dd\s+if=\S+\s+bs=1M\s+2>/dev/null\"\s*>\s*\S+$"),
-        re.compile(r"^adb\s+-s\s+\S+\s+shell\s+(uname|ls|cat|stat)(\s+\S+)*$"),
+        re.compile(r"^adb\s+-s\s+\S+\s+shell\s+(uname|ls|cat|stat)(\s+[^\s;|&$\n]+)*$"),
+        re.compile(r"^adb\s+-s\s+\S+\s+shell\s+ls\s+-l\s+\S+$"),
+        re.compile(r"^adb\s+-s\s+\S+\s+shell\s+mount$"),
         re.compile(r"^adb\s+-s\s+\S+\s+(install|uninstall|push|pull|reboot|wait-for-\S+|get-state)(\s+\S+)*$"),
         # Play Integrity live probe: launch checker app, dump UI hierarchy, tap button.
         re.compile(r"^adb\s+-s\s+\S+\s+shell\s+am\s+force-stop\s+\S+$"),

@@ -493,14 +493,180 @@ def test_flash_partition_aborts_when_backup_fails(
 # ---------------------------------------------------------------------------
 # Read-only deferred stubs (LJD-277)
 # ---------------------------------------------------------------------------
-def _make_readonly_ops(monkeypatch: pytest.MonkeyPatch):
+def _make_readonly_ops(monkeypatch: pytest.MonkeyPatch, device_id: str = "FAKE001"):
     """Return a DeviceOps instance with a mocked gateway and shell runner."""
     gateway_mock = MagicMock()
     from pixel_flasher_plugin.safety_engine import Decision
     gateway_mock.evaluate.return_value = (Decision.ALLOW, "")
-    ops = DeviceOps(device_id="FAKE001", gateway=gateway_mock)
+    ops = DeviceOps(device_id=device_id, gateway=gateway_mock)
     ops._run_shell_safe = MagicMock(return_value=MagicMock(returncode=0, stdout="", stderr=""))  # type: ignore[method-assign]
     return ops
+
+
+# ---------------------------------------------------------------------------
+# get_device_prop -- real-hardware bug 1
+# ---------------------------------------------------------------------------
+def test_get_device_prop_valid_returns_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A valid property name returns the parsed stdout value."""
+    ops = _make_readonly_ops(monkeypatch, device_id="100.123.230.67:5555")
+    calls: list[str] = []
+
+    def _fake_run(cmd: str, timeout: int | None = None):
+        calls.append(cmd)
+        mock = MagicMock()
+        mock.returncode = 0
+        mock.stdout = "Pixel 10 Pro XL\n"
+        mock.stderr = ""
+        return mock
+
+    ops._run_shell_safe = MagicMock(side_effect=_fake_run)  # type: ignore[method-assign]
+
+    result = ops.get_device_prop("ro.product.model")
+
+    assert result.success is True
+    assert result.data == {"prop": "ro.product.model", "value": "Pixel 10 Pro XL"}
+    assert len(calls) == 1
+    # device_id and prop must be shell-quoted (network serial contains ':').
+    assert "100.123.230.67:5555" in calls[0]
+    assert "ro.product.model" in calls[0]
+
+
+def test_get_device_prop_invalid_rejected_pre_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Property names with shell metacharacters are rejected before any adb call."""
+    ops = _make_readonly_ops(monkeypatch)
+    ops._run_shell_safe = MagicMock()  # type: ignore[method-assign]
+
+    for bad_prop in ["ro.product; rm -rf /", "ro.product$(id)", "ro product", "ro.product\nid"]:
+        result = ops.get_device_prop(bad_prop)
+        assert result.success is False, f"Expected rejection for {bad_prop!r}"
+        assert "Invalid property name" in (result.error or "")
+
+    ops._run_shell_safe.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# list_partitions -- real-hardware bug 2
+# ---------------------------------------------------------------------------
+def test_list_partitions_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Partition entries include size, type, fs_type and mount_point."""
+    ops = _make_readonly_ops(monkeypatch)
+    fake_dev = ops._lazy_device()
+    fake_dev.get_partitions.return_value = ["boot", "system", "vendor"]
+
+    def _fake_run(cmd: str, timeout: int | None = None):
+        mock = MagicMock()
+        if "blockdev" in cmd:
+            mock.returncode = 0
+            if "boot" in cmd:
+                mock.stdout = "67108864\n"
+            elif "system" in cmd:
+                mock.stdout = "1073741824\n"
+            else:
+                mock.stdout = "209715200\n"
+        elif "ls -l /dev/block/by-name" in cmd:
+            mock.returncode = 0
+            if "boot" in cmd:
+                mock.stdout = "lrwxrwxrwx 1 root root 21 1970-01-01 00:00 /dev/block/by-name/boot -> /dev/block/sda37"
+            elif "system" in cmd:
+                mock.stdout = "lrwxrwxrwx 1 root root 21 1970-01-01 00:00 /dev/block/by-name/system -> /dev/block/sda38"
+            else:
+                mock.stdout = "lrwxrwxrwx 1 root root 21 1970-01-01 00:00 /dev/block/by-name/vendor -> /dev/block/sda39"
+        elif "mount" in cmd:
+            mock.returncode = 0
+            mock.stdout = (
+                "/dev/block/sda37 on / type ext4 (rw,seclabel,relatime,data=ordered)\n"
+                "/dev/block/sda38 on /system type ext4 (rw,seclabel,relatime,data=ordered)\n"
+            )
+        else:
+            mock.returncode = 0
+            mock.stdout = ""
+        return mock
+
+    ops._run_shell_safe = MagicMock(side_effect=_fake_run)  # type: ignore[method-assign]
+
+    result = ops.list_partitions()
+
+    assert result.success is True
+    entries = (result.data or {}).get("partitions", [])
+    assert len(entries) == 3
+
+    boot = next(e for e in entries if e["name"] == "boot")
+    assert boot["size"] == 67108864
+    assert boot["type"] == "sda37"
+    assert boot["fs_type"] == "ext4"
+    assert boot["mount_point"] == "/"
+
+    system = next(e for e in entries if e["name"] == "system")
+    assert system["size"] == 1073741824
+    assert system["type"] == "sda38"
+    assert system["fs_type"] == "ext4"
+    assert system["mount_point"] == "/system"
+
+    vendor = next(e for e in entries if e["name"] == "vendor")
+    assert vendor["size"] == 209715200
+    assert vendor["type"] == "sda39"
+    assert vendor["fs_type"] is None
+    assert vendor["mount_point"] is None
+
+
+def test_list_partitions_probe_failure_sets_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A per-partition probe failure leaves that field None without sinking the list."""
+    ops = _make_readonly_ops(monkeypatch)
+    fake_dev = ops._lazy_device()
+    fake_dev.get_partitions.return_value = ["boot"]
+
+    def _fake_run(cmd: str, timeout: int | None = None):
+        mock = MagicMock()
+        if "blockdev" in cmd:
+            mock.returncode = 1
+            mock.stdout = ""
+            mock.stderr = "su: not found"
+        elif "ls -l" in cmd:
+            mock.returncode = 1
+            mock.stdout = ""
+            mock.stderr = "No such file"
+        elif "mount" in cmd:
+            mock.returncode = 0
+            mock.stdout = "/dev/block/sda37 on / type ext4 (rw)\n"
+        else:
+            mock.returncode = 0
+            mock.stdout = ""
+        return mock
+
+    ops._run_shell_safe = MagicMock(side_effect=_fake_run)  # type: ignore[method-assign]
+
+    result = ops.list_partitions()
+
+    assert result.success is True
+    entries = (result.data or {}).get("partitions", [])
+    assert len(entries) == 1
+    assert entries[0]["name"] == "boot"
+    assert entries[0]["size"] is None
+    assert entries[0]["type"] is None
+    assert entries[0]["fs_type"] is None
+    assert entries[0]["mount_point"] is None
+
+
+# ---------------------------------------------------------------------------
+# list_packages -- real-hardware bug 3
+# ---------------------------------------------------------------------------
+def test_list_packages_filter_mapping(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Filter values map to the correct pm flags and invalid filters are rejected."""
+    ops = _make_readonly_ops(monkeypatch)
+    fake_dev = ops._lazy_device()
+    fake_dev.get_package_list.return_value = "com.example\n"
+
+    ops.list_packages(filter="all")
+    ops.list_packages(filter="system")
+    ops.list_packages(filter="third_party")
+    ops.list_packages(filter="-3")
+
+    calls = [call.args[0] for call in fake_dev.get_package_list.call_args_list]
+    assert calls == ["all", "system", "3rdparty", "3rdparty"]
+
+    result = ops.list_packages(filter="bad;filter")
+    assert result.success is False
+    assert "Invalid package filter" in (result.error or "")
 
 
 def test_get_pif_status_reads_json_config(monkeypatch: pytest.MonkeyPatch) -> None:

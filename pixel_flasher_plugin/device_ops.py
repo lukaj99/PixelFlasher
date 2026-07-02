@@ -81,6 +81,8 @@ class DeviceOps:
         "Wild_KSU",
     }
 
+    _PROP_NAME_RE: ClassVar[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9_.\[\]-]+$")
+
     _SUPPORTED_CHECKER_APPS: ClassVar[list[dict[str, Any]]] = [
         {
             "package": "gr.nikolasspyr.integritycheck",
@@ -462,8 +464,118 @@ class DeviceOps:
             self._log("get_system_info", None, False)
             return self._tool_error("get_system_info", exc)
 
+    def get_device_prop(self, prop: str) -> ToolResult:
+        """Read a single Android system property via getprop."""
+        if not prop or not self._PROP_NAME_RE.match(prop):
+            return ToolResult(
+                success=False,
+                error=f"Invalid property name: {prop!r}",
+            )
+
+        try:
+            subcommand = f"shell getprop {self._q(prop)}"
+            command = self._adb_cmd(subcommand)
+            blocked = self._evaluate(command, RiskTier.INFO, confirm=False)
+            if blocked:
+                self._log("get_device_prop", command, False)
+                return blocked
+
+            exec_cmd = self._exec_adb_cmd(subcommand)
+            res = self._run_shell_safe(exec_cmd, timeout=30)
+            success = res.returncode == 0
+            self._log("get_device_prop", command, success)
+            if not success:
+                return ToolResult(
+                    success=False,
+                    error=f"getprop failed (exit {res.returncode}): {res.stderr}",
+                    command=command,
+                )
+            stdout = res.stdout.strip() or None
+            return ToolResult(
+                success=True,
+                data={"prop": prop, "value": stdout},
+                command=command,
+            )
+        except Exception as exc:
+            self._log("get_device_prop", None, False)
+            return self._tool_error("get_device_prop", exc)
+
     def list_partitions(self) -> ToolResult:
-        """List block-device partitions exposed by the device."""
+        """List block-device partitions exposed by the device with metadata."""
+
+        def _mount_info() -> list[tuple[str, str, str]]:
+            subcommand = "shell mount"
+            command = self._adb_cmd(subcommand)
+            blocked = self._evaluate(command, RiskTier.INFO, confirm=False)
+            if blocked:
+                return []
+            exec_cmd = self._exec_adb_cmd(subcommand)
+            res = self._run_shell_safe(exec_cmd, timeout=30)
+            if res.returncode != 0:
+                return []
+            entries: list[tuple[str, str, str]] = []
+            for line in res.stdout.splitlines():
+                if " on " not in line:
+                    continue
+                dev_path, rest = line.split(" on ", 1)
+                parts = rest.split()
+                if len(parts) < 3 or parts[1] != "type":
+                    continue
+                entries.append((dev_path.strip(), parts[0], parts[2]))
+            return entries
+
+        def _block_path(name: str) -> str:
+            return f"/dev/block/by-name/{name}"
+
+        def _size_and_target(name: str) -> tuple[int | None, str | None]:
+            block_path = _block_path(name)
+            # Resolve the by-name symlink target first (used for type and mount matching).
+            target: str | None = None
+            ls_subcommand = f"shell ls -l {self._q(block_path)}"
+            ls_command = self._adb_cmd(ls_subcommand)
+            blocked = self._evaluate(ls_command, RiskTier.INFO, confirm=False)
+            if not blocked:
+                exec_cmd = self._exec_adb_cmd(ls_subcommand)
+                res = self._run_shell_safe(exec_cmd, timeout=30)
+                if res.returncode == 0:
+                    line = res.stdout.strip()
+                    if " -> " in line:
+                        target = line.split(" -> ", 1)[1].strip().lstrip("./")
+                        target = os.path.basename(target)
+
+            # Try root blockdev for the size.
+            size: int | None = None
+            subcommand = f"shell su -c \"blockdev --getsize64 {self._q(block_path)}\""
+            command = self._adb_cmd(subcommand)
+            blocked = self._evaluate(command, RiskTier.INFO, confirm=False)
+            if not blocked:
+                exec_cmd = self._exec_adb_cmd(subcommand)
+                res = self._run_shell_safe(exec_cmd, timeout=30)
+                if res.returncode == 0:
+                    try:
+                        size = int(res.stdout.strip())
+                        return size, target
+                    except Exception:
+                        pass
+
+            # Fall back to /proc/partitions using the resolved device name.
+            if target:
+                proc_subcommand = "shell cat /proc/partitions"
+                proc_command = self._adb_cmd(proc_subcommand)
+                blocked = self._evaluate(proc_command, RiskTier.INFO, confirm=False)
+                if not blocked:
+                    proc_exec = self._exec_adb_cmd(proc_subcommand)
+                    proc_res = self._run_shell_safe(proc_exec, timeout=30)
+                    if proc_res.returncode == 0:
+                        for proc_line in proc_res.stdout.splitlines():
+                            parts = proc_line.split()
+                            if len(parts) >= 4 and parts[-1] == target:
+                                try:
+                                    return int(parts[2]) * 1024, target
+                                except Exception:
+                                    break
+            return size, target
+
         try:
             dev = self._lazy_device()
             partitions = dev.get_partitions()
@@ -472,7 +584,35 @@ class DeviceOps:
                     success=False,
                     error="Could not retrieve partition list (device may be disconnected or not in ADB mode)",
                 )
-            entries = [{"name": name.strip()} for name in partitions if name.strip()]
+
+            mounts = _mount_info()
+            entries: list[dict[str, Any]] = []
+            for raw_name in partitions:
+                name = raw_name.strip()
+                if not name:
+                    continue
+                entry: dict[str, Any] = {
+                    "name": name,
+                    "size": None,
+                    "type": None,
+                    "fs_type": None,
+                    "mount_point": None,
+                }
+                try:
+                    size, target = _size_and_target(name)
+                    entry["size"] = size
+                    entry["type"] = target
+                    # Match mount entries by partition name or resolved device name.
+                    for dev_path, mount_point, fs_type in mounts:
+                        if name in dev_path or (target and target in dev_path):
+                            entry["mount_point"] = mount_point
+                            entry["fs_type"] = fs_type
+                            break
+                except Exception:
+                    # Per-partition probe failure must not sink the whole list.
+                    pass
+                entries.append(entry)
+
             self._log("list_partitions", None, True)
             return ToolResult(
                 success=True,
@@ -1515,11 +1655,43 @@ class DeviceOps:
             self._log("read_partition", None, False)
             return self._tool_error("read_partition", exc)
 
-    def list_packages(self) -> ToolResult:
-        """Return installed package names via ``pm list packages``."""
+    def list_packages(self, filter: str | None = None) -> ToolResult:
+        """Return installed package names via ``pm list packages``.
+
+        Args:
+            filter: Optional package filter. Supported values are ``all``,
+                ``third_party``/``user``, ``system``, ``enabled``, ``disabled``,
+                ``uninstalled``, or a literal pm flag in ``-[3sedu]``.
+        """
+        filter_to_state: dict[str, str] = {
+            "all": "all",
+            "third_party": "3rdparty",
+            "user": "3rdparty",
+            "system": "system",
+            "enabled": "enabled",
+            "disabled": "disabled",
+            "uninstalled": "all+uninstalled",
+            "-3": "3rdparty",
+            "-s": "system",
+            "-e": "enabled",
+            "-d": "disabled",
+            "-u": "all+uninstalled",
+        }
+
+        normalized = (filter or "").strip()
+        if normalized == "" or normalized == "all":
+            state = "all"
+        elif normalized in filter_to_state:
+            state = filter_to_state[normalized]
+        else:
+            return ToolResult(
+                success=False,
+                error="Invalid package filter",
+            )
+
         try:
             dev = self._lazy_device()
-            output = dev.get_package_list("all")
+            output = dev.get_package_list(state)
             if output is None:
                 return ToolResult(
                     success=False,
