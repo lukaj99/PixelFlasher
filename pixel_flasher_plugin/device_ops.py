@@ -16,11 +16,12 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import time
 import xml.etree.ElementTree as ET
 import zipfile
 from typing import Any, ClassVar
 
-from pixel_flasher_plugin import command_validator, telemetry
+from pixel_flasher_plugin import boot_patcher, command_validator, telemetry
 from pixel_flasher_plugin.headless_runtime import bootstrap, get_device
 from pixel_flasher_plugin.headless_runtime import runtime as _runtime
 from pixel_flasher_plugin.headless_runtime import run_shell as _run_shell
@@ -61,6 +62,22 @@ class DeviceOps:
         "init_boot",
         "vendor_boot",
         "dtbo",
+    }
+
+    _KNOWN_ANDROID_ABIS: ClassVar[set[str]] = {
+        "arm64-v8a",
+        "armeabi-v7a",
+        "x86",
+        "x86_64",
+    }
+
+    _PATCH_METHODS: ClassVar[set[str]] = {
+        "Magisk",
+        "KernelSU",
+        "KernelSU-Next",
+        "APatch",
+        "SukiSU",
+        "Wild_KSU",
     }
 
     def __init__(
@@ -614,26 +631,37 @@ class DeviceOps:
         self,
         boot_path: str,
         method: str = "Magisk",
+        apk_path: str | None = None,
+        superkey: str | None = None,
+        kmi_override: str | None = None,
+        mount_type: str | None = None,
         dry_run: bool = True,
         confirm: bool = False,
     ) -> ToolResult:
-        """Validate and inspect a boot image for patching.
+        """Validate, preview, and patch a boot image for the requested root solution.
 
-        Wave 1 implementation: this tool performs real validation (ANDROID!
-        magic header, size, and header metadata) but does NOT actually patch
-        the image.  Full Magisk/KernelSU/APatch patching requires the patching
-        binary from the respective root solution and is deferred to a later
-        wave or the PixelFlasher GUI.
+        This is a CRITICAL operation: ``dry_run=True`` previews the generated
+        on-device script, and ``confirm=True`` is required for execution.
         """
-        resolved = os.path.abspath(os.path.expanduser(boot_path))
-        if not os.path.isfile(resolved):
+        if method not in self._PATCH_METHODS:
             return ToolResult(
                 success=False,
-                error=f"Boot image not found: {resolved}",
+                error=f"Unsupported patch method: {method}. "
+                f"Supported: {sorted(self._PATCH_METHODS)}",
             )
 
+        resolved_boot = os.path.abspath(os.path.expanduser(boot_path))
+        if not os.path.isfile(resolved_boot):
+            return ToolResult(
+                success=False,
+                error=f"Boot image not found: {resolved_boot}",
+            )
+
+        stock_sha1 = ""
+        metadata: dict[str, Any] = {"method": method, "local_boot": True}
+
         try:
-            with open(resolved, "rb") as f:
+            with open(resolved_boot, "rb") as f:
                 header = f.read(44)
         except Exception as exc:
             return ToolResult(
@@ -644,11 +672,12 @@ class DeviceOps:
         if len(header) < 8 or header[:8] != b"ANDROID!":
             return ToolResult(
                 success=False,
-                error=f"Invalid boot image: missing ANDROID! magic header in {resolved}",
+                error=f"Invalid boot image: missing ANDROID! magic header in {resolved_boot}",
             )
 
         try:
             import struct
+
             (
                 kernel_size,
                 kernel_addr,
@@ -666,10 +695,10 @@ class DeviceOps:
                 error=f"Failed to parse boot image header: {exc}",
             )
 
-        metadata = {
-            "image_path": resolved,
+        metadata.update({
+            "image_path": resolved_boot,
             "magic_valid": True,
-            "file_size": os.path.getsize(resolved),
+            "file_size": os.path.getsize(resolved_boot),
             "kernel_size": kernel_size,
             "kernel_addr": kernel_addr,
             "ramdisk_size": ramdisk_size,
@@ -679,20 +708,72 @@ class DeviceOps:
             "tags_addr": tags_addr,
             "page_size": page_size,
             "header_version": header_version,
-            "method": method,
-        }
+        })
+        stock_sha1 = hashlib.sha1(open(resolved_boot, "rb").read()).hexdigest()
 
-        deferred_warning = (
-            "Actual Magisk/KernelSU/APatch patching is not yet implemented; "
-            "this tool currently validates and inspects the boot image only."
-        )
+        # Method-specific input validation.
+        if method == "APatch":
+            if not superkey:
+                return ToolResult(success=False, error="APatch requires superkey")
+            if len(superkey) < 8 or not any(c.isalpha() for c in superkey) or not any(c.isdigit() for c in superkey):
+                return ToolResult(
+                    success=False,
+                    error="APatch superkey must be at least 8 characters and contain both letters and digits",
+                )
 
+        resolved_apk: str | None = None
+        if apk_path:
+            resolved_apk = os.path.abspath(os.path.expanduser(apk_path))
+            if not os.path.isfile(resolved_apk):
+                return ToolResult(
+                    success=False,
+                    error=f"APK not found: {resolved_apk}",
+                )
+            if not zipfile.is_zipfile(resolved_apk):
+                return ToolResult(
+                    success=False,
+                    error=f"APK is not a valid ZIP file: {resolved_apk}",
+                )
+
+        if mount_type and mount_type not in {"magicmount", "overlayfs", "dynamic"}:
+            return ToolResult(
+                success=False,
+                error=f"Invalid mount_type: {mount_type}. Use magicmount, overlayfs, or dynamic",
+            )
+
+        # Unique on-device working directory for this patching run.
+        timestamp = int(time.time())
+        work_dir = f"/data/local/tmp/pf_{timestamp}"
+        zip_path = f"{work_dir}.zip"
+        script_path = "/data/local/tmp/pf_patch.sh"
+        out_dir = "/data/local/tmp"
+        boot_device_path = f"{work_dir}_stock_boot.img"
+
+        # Dry-run path: generate script preview without touching the device.
         if dry_run:
+            preview_metadata = dict(metadata)
+            preview_metadata["script_preview"] = self._generate_patch_script(
+                method=method,
+                boot_path=boot_device_path,
+                work_dir=work_dir,
+                zip_path=zip_path,
+                arch=self._get_arch(),
+                version_code=self._get_solution_version_code(method),
+                stock_sha1=stock_sha1,
+                superkey=superkey,
+                kmi_override=kmi_override,
+                mount_type=mount_type,
+            )
+            if not resolved_apk:
+                preview_metadata["script_preview"] = None
+                preview_metadata.setdefault("warnings", []).append(
+                    "apk_path required for full script preview"
+                )
             return ToolResult(
                 success=True,
                 dry_run=True,
-                data=metadata,
-                warnings=["Dry run - no changes made", deferred_warning],
+                data=preview_metadata,
+                warnings=["Dry run - no changes made"],
             )
 
         if not confirm:
@@ -701,13 +782,275 @@ class DeviceOps:
                 error="CRITICAL operation requires confirm=True",
             )
 
-        # confirm=True, but patching itself is still deferred.
-        return ToolResult(
-            success=True,
-            dry_run=False,
-            data=metadata,
-            warnings=[deferred_warning],
+        if not resolved_apk:
+            return ToolResult(
+                success=False,
+                error="apk_path is required to execute patching",
+            )
+
+        preflight = self._run_preflight(RiskTier.CRITICAL)
+        if preflight:
+            return preflight
+
+        dev = self._lazy_device()
+        arch = self._get_arch()
+        version_code = self._get_solution_version_code(method)
+
+        push_cmd = f"adb -s {self._q(self.device_id)} push {self._q(resolved_boot)} {self._q(boot_device_path)}"
+        res = self.run_shell(push_cmd, confirm=True)
+        if not res.success:
+            return ToolResult(
+                success=False,
+                error=f"Failed to push boot image: {res.error}",
+                command=push_cmd,
+            )
+
+        # Push the APK to the device.
+        push_apk_cmd = f"adb -s {self._q(self.device_id)} push {self._q(resolved_apk)} {self._q(zip_path)}"
+        res = self.run_shell(push_apk_cmd, confirm=True)
+        if not res.success:
+            return ToolResult(
+                success=False,
+                error=f"Failed to push APK: {res.error}",
+                command=push_apk_cmd,
+            )
+
+        # Push busybox to the device.
+        busybox_local = self._busybox_path(arch)
+        if not busybox_local:
+            return ToolResult(
+                success=False,
+                error=f"Busybox binary not found for architecture {arch}",
+            )
+        busybox_device = "/data/local/tmp/busybox"
+        push_busy_cmd = f"adb -s {self._q(self.device_id)} push {self._q(busybox_local)} {self._q(busybox_device)}"
+        res = self.run_shell(push_busy_cmd, confirm=True)
+        if not res.success:
+            return ToolResult(
+                success=False,
+                error=f"Failed to push busybox: {res.error}",
+                command=push_busy_cmd,
+            )
+
+        # Generate and push the patch script.
+        script = self._generate_patch_script(
+            method=method,
+            boot_path=boot_device_path,
+            work_dir=work_dir,
+            zip_path=zip_path,
+            arch=arch,
+            version_code=version_code,
+            stock_sha1=stock_sha1,
+            superkey=superkey,
+            kmi_override=kmi_override,
+            mount_type=mount_type,
         )
+
+        local_script = tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False).name
+        try:
+            with open(local_script, "w", encoding="utf-8") as f:
+                f.write(script)
+
+            push_script_cmd = f"adb -s {self._q(self.device_id)} push {self._q(local_script)} {self._q(script_path)}"
+            res = self.run_shell(push_script_cmd, confirm=True)
+            if not res.success:
+                return ToolResult(
+                    success=False,
+                    error=f"Failed to push patch script: {res.error}",
+                    command=push_script_cmd,
+                )
+
+            chmod_cmd = f"adb -s {self._q(self.device_id)} shell chmod 755 {self._q(script_path)}"
+            res = self.run_shell(chmod_cmd, confirm=True)
+            if not res.success:
+                return ToolResult(
+                    success=False,
+                    error=f"Failed to chmod patch script: {res.error}",
+                    command=chmod_cmd,
+                )
+
+            exec_cmd = f"adb -s {self._q(self.device_id)} shell /data/local/tmp/pf_patch.sh"
+            res = self.run_shell(exec_cmd, confirm=True, timeout=300)
+            if not res.success:
+                return ToolResult(
+                    success=False,
+                    error=f"Patch script failed: {res.error}",
+                    command=exec_cmd,
+                    data=res.data,
+                )
+
+            # Read the patch log.
+            log_cmd = f"adb -s {self._q(self.device_id)} shell cat /data/local/tmp/pf_patch.log"
+            log_res = self.run_shell(log_cmd, confirm=True)
+            if not log_res.success:
+                return ToolResult(
+                    success=False,
+                    error=f"Failed to read patch log: {log_res.error}",
+                    command=log_cmd,
+                )
+            log_stdout = (log_res.data or {}).get("stdout", "")
+            parsed = boot_patcher.parse_patch_log(log_stdout)
+            if not parsed["patched_filename"]:
+                return ToolResult(
+                    success=False,
+                    error="Patch log did not report a patched file",
+                    command=exec_cmd,
+                )
+
+            patched_path = f"{out_dir}/{parsed['patched_filename']}"
+
+            # Pull and verify the patched image.
+            local_patched = tempfile.NamedTemporaryFile(suffix=".img", delete=False).name
+            try:
+                pull_cmd = f"adb -s {self._q(self.device_id)} pull {self._q(patched_path)} {self._q(local_patched)}"
+                pull_res = self.run_shell(pull_cmd, confirm=True)
+                if not pull_res.success:
+                    return ToolResult(
+                        success=False,
+                        error=f"Failed to pull patched image: {pull_res.error}",
+                        command=pull_cmd,
+                    )
+
+                if not os.path.isfile(local_patched) or os.path.getsize(local_patched) == 0:
+                    return ToolResult(
+                        success=False,
+                        error="Patched image is empty or missing",
+                        command=exec_cmd,
+                    )
+
+                with open(local_patched, "rb") as f:
+                    magic = f.read(8)
+                if magic != b"ANDROID!":
+                    return ToolResult(
+                        success=False,
+                        error="Patched image has invalid ANDROID! magic header",
+                        command=exec_cmd,
+                    )
+
+                with open(local_patched, "rb") as f:
+                    patched_sha256 = hashlib.sha256(f.read()).hexdigest()
+            finally:
+                try:
+                    os.remove(local_patched)
+                except Exception:
+                    pass
+
+            return ToolResult(
+                success=True,
+                dry_run=False,
+                data={
+                    "patched_path": patched_path,
+                    "method": method,
+                    "version": parsed.get("version") or version_code,
+                    "sha256": patched_sha256,
+                    "patch_sha1": parsed.get("patch_sha1") or "",
+                    "stock_sha1": stock_sha1,
+                    "patch_filename": parsed["patched_filename"],
+                    "boot_metadata": metadata,
+                },
+                command=exec_cmd,
+            )
+        finally:
+            try:
+                os.remove(local_script)
+            except Exception:
+                pass
+
+    def _generate_patch_script(
+        self,
+        method: str,
+        boot_path: str,
+        work_dir: str,
+        zip_path: str,
+        arch: str,
+        version_code: str,
+        stock_sha1: str,
+        superkey: str | None,
+        kmi_override: str | None,
+        mount_type: str | None,
+    ) -> str:
+        """Dispatch to the per-solution script generator."""
+        out_dir = "/data/local/tmp"
+        if method == "Magisk":
+            return boot_patcher.generate_magisk_script(
+                boot_path=boot_path,
+                work_dir=work_dir,
+                zip_path=zip_path,
+                out_dir=out_dir,
+                arch=arch,
+                stock_sha1=stock_sha1,
+                version_code=version_code,
+            )
+        if method == "APatch":
+            return boot_patcher.generate_apatch_script(
+                boot_path=boot_path,
+                work_dir=work_dir,
+                zip_path=zip_path,
+                out_dir=out_dir,
+                arch=arch,
+                stock_sha1=stock_sha1,
+                superkey=superkey or "",
+                version_code=version_code,
+            )
+        return boot_patcher.generate_ksu_script(
+            boot_path=boot_path,
+            work_dir=work_dir,
+            zip_path=zip_path,
+            out_dir=out_dir,
+            arch=arch,
+            stock_sha1=stock_sha1,
+            version_code=version_code,
+            kmi_override=kmi_override,
+            mount_type=mount_type,
+            method=method,
+        )
+
+    def _get_arch(self) -> str:
+        """Return a sane device ABI, falling back to arm64-v8a."""
+        try:
+            dev = self._lazy_device()
+            arch = dev.architecture
+            if arch in self._KNOWN_ANDROID_ABIS:
+                return arch
+        except Exception:
+            pass
+        return "arm64-v8a"
+
+    def _get_solution_version_code(self, method: str) -> str:
+        """Best-effort version code from the device's installed root app."""
+        mapping = {
+            "Magisk": "magisk_app_version_code",
+            "KernelSU": "ksu_app_version_code",
+            "KernelSU-Next": "ksu_next_app_version_code",
+            "APatch": "apatch_app_version_code",
+            "SukiSU": "sukisu_app_version_code",
+            "Wild_KSU": "wild_ksu_app_version_code",
+        }
+        prop = mapping.get(method)
+        if not prop:
+            return "0"
+        try:
+            dev = self._lazy_device()
+            val = getattr(dev, prop, None)
+            if val is None:
+                return "0"
+            s = str(val).strip()
+            int(s)
+            return s
+        except Exception:
+            return "0"
+
+    def _busybox_path(self, arch: str) -> str | None:
+        """Return the bundled busybox path for *arch*, or None if missing."""
+        try:
+            from runtime import get_bundle_dir
+
+            path = os.path.join(get_bundle_dir(), "bin", f"busybox_{arch}")
+            if os.path.isfile(path):
+                return path
+        except Exception:
+            pass
+        return None
 
     def flash_factory_image(
         self,

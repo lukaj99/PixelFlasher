@@ -68,6 +68,14 @@ class CommandValidator:
             r"^adb\s+-s\s+\S+\s+shell\s+su\s+-c\s+"
             r"'for\s+FILE\s+in\s+/data/adb/modules/\*;\s+do\s+if\s+test\s+-d\s+\"\$FILE\";\s+then\s+echo\s+\$FILE;\s+if\s+test\s+-f\s+\"\$FILE/remove\";\s+then\s+echo\s+\"state=remove\";\s+elif\s+test\s+-f\s+\"\$FILE/disable\";\s+then\s+echo\s+\"state=disabled\";\s+else\s+echo\s+\"state=enabled\";\s+fi;\s+if\s+test\s+-f\s+\"\$FILE/action\.sh\";\s+then\s+echo\s+\"hasAction=True\";\s+else\s+echo\s+\"hasAction=False\";\s+fi;\s+cat\s+\"\$FILE/module\.prop\";\s+echo;\s+echo\s+-----pf;\s+fi;\s+done'$"
         ),
+        # Boot patch script execution (direct or under su).
+        re.compile(r"^adb\s+-s\s+\S+\s+shell\s+/data/local/tmp/pf_patch\.sh$"),
+        re.compile(r"^adb\s+-s\s+\S+\s+shell\s+su\s+-c\s+'/data/local/tmp/pf_patch\.sh'$"),
+        re.compile(r"^adb\s+-s\s+\S+\s+shell\s+su\s+-c\s+\"\./boot_patch\.sh(\s+\S+)*\"$"),
+        re.compile(r"^adb\s+-s\s+\S+\s+shell\s+su\s+-c\s+\"ksud\s+boot-patch(\s+\S+)*\"$"),
+        # Boot patch helper commands.
+        re.compile(r"^adb\s+-s\s+\S+\s+shell\s+chmod\s+755\s+/data/local/tmp/\S+$"),
+        re.compile(r"^adb\s+-s\s+\S+\s+shell\s+dd\s+if=/data/local/tmp/\S+\s+bs=1\s+count=\d+$"),
     ]
 
     ALLOWED_FASTBOOT_COMMANDS = [

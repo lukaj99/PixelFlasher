@@ -133,8 +133,13 @@ class BootPatchOutput(BaseModel):
     method: str | None = Field(default=None, description="Magisk | KernelSU | APatch")
     version: str | None = Field(default=None, description="Root solution version used")
     sha256: str | None = Field(default=None, description="SHA256 of patched image")
+    patch_sha1: str | None = Field(default=None, description="Short SHA1 of patched image")
+    stock_sha1: str | None = Field(default=None, description="SHA1 of stock boot image")
+    patch_filename: str | None = Field(default=None, description="Filename of the patched image")
+    boot_metadata: dict | None = Field(default=None, description="Parsed boot image header info")
     dry_run: bool = Field(default=True, description="Whether this was a dry run")
     warnings: list[str] = Field(default_factory=list, description="Non-fatal warnings")
+    error: str | None = Field(default=None, description="Error message if success=False")
 
 
 class FactoryFlashOutput(BaseModel):

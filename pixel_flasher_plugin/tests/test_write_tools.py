@@ -126,10 +126,16 @@ def _craft_factory_zip(path: str, img_names=("boot.img", "system.img", "vendor.i
 class TestPatchBootImage:
     """Validation + dry-run + confirm-gate for boot image patching."""
 
-    def test_dry_run_returns_parsed_metadata(
+    def _apk_zip(self, tmp_path) -> str:
+        apk = tmp_path / "magisk.apk"
+        with zipfile.ZipFile(apk, "w") as zf:
+            zf.writestr("assets/boot_patch.sh", b"#!/system/bin/sh\n")
+        return str(apk)
+
+    def test_dry_run_returns_parsed_metadata_and_script(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path
     ) -> None:
-        """dry_run=True returns the parsed header fields and a deferred warning."""
+        """dry_run=True returns parsed header fields and a generated script preview."""
         ops, _ = _make_write_ops(monkeypatch)
         img = tmp_path / "boot.img"
         _craft_boot_image(
@@ -139,8 +145,11 @@ class TestPatchBootImage:
             page_size=4096,
             header_version=2,
         )
+        apk = self._apk_zip(tmp_path)
 
-        result = ops.patch_boot_image(str(img), method="Magisk", dry_run=True)
+        result = ops.patch_boot_image(
+            str(img), method="Magisk", apk_path=apk, dry_run=True
+        )
 
         assert result.success is True
         assert result.dry_run is True
@@ -151,8 +160,9 @@ class TestPatchBootImage:
         assert data["page_size"] == 4096
         assert data["header_version"] == 2
         assert data["method"] == "Magisk"
-        # Deferred-patching warning must surface on the dry-run path.
-        assert any("not yet implemented" in w for w in (result.warnings or []))
+        script_preview = data.get("script_preview") or ""
+        assert "boot_patch.sh" in script_preview
+        assert str(img) in script_preview or "/data/local/tmp/pf" in script_preview
         # Dry run MUST NOT touch any shell.
         ops._run_shell_safe.assert_not_called()
 
@@ -209,26 +219,18 @@ class TestPatchBootImage:
         assert result.success is False
         assert "confirm=True" in (result.error or "")
 
-    def test_dry_run_false_with_confirm_reports_deferred(
+    def test_dry_run_false_with_confirm_requires_apk(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path
     ) -> None:
-        """dry_run=False + confirm=True succeeds but reports deferred patching.
-
-        Even when the confirm gate is satisfied, actual patching is not yet
-        implemented in Wave 2b; the tool still returns the parsed metadata
-        and the deferred-patching warning so callers can preview what would
-        happen.
-        """
+        """dry_run=False + confirm=True requires apk_path to execute."""
         ops, _ = _make_write_ops(monkeypatch)
         img = tmp_path / "boot.img"
         _craft_boot_image(str(img))
 
         result = ops.patch_boot_image(str(img), dry_run=False, confirm=True)
 
-        assert result.success is True
-        assert result.dry_run is False
-        assert (result.data or {}).get("magic_valid") is True
-        assert any("not yet implemented" in w for w in (result.warnings or []))
+        assert result.success is False
+        assert "apk_path" in (result.error or "").lower()
 
 
 # ===========================================================================

@@ -570,37 +570,45 @@ def patch_boot_image(
     device_id: str,
     boot_path: str,
     method: str = "Magisk",
+    apk_path: str | None = None,
+    superkey: str | None = None,
+    kmi_override: str | None = None,
+    mount_type: str | None = None,
     dry_run: bool = True,
     confirm: bool = False,
 ) -> BootPatchOutput:
-    """Validate and inspect a boot image for Magisk/KernelSU/APatch patching. CRITICAL operation.
+    """Patch a stock boot image with Magisk, KernelSU, APatch, etc. CRITICAL operation.
 
-    Wave 1 implementation: this tool performs real validation (ANDROID! magic
-    header, size, and header metadata) but does NOT actually patch the image.
-    Full Magisk/KernelSU/APatch patching requires the patching binary from the
-    respective root solution and is deferred to a later wave or the
-    PixelFlasher GUI.
-
-    Defaults to dry_run=True (preview mode). To execute validation, pass
-    dry_run=False AND confirm=True.
+    Defaults to dry_run=True (preview mode). To execute, pass dry_run=False
+    AND confirm=True. An ``apk_path`` pointing to the root-solution APK is
+    required for actual patching.
     """
     ops = _ops(device_id, ctx)
     if dry_run:
-        result = ops.patch_boot_image(boot_path, method=method, dry_run=True, confirm=False)
+        result = ops.patch_boot_image(
+            boot_path,
+            method=method,
+            apk_path=apk_path,
+            superkey=superkey,
+            kmi_override=kmi_override,
+            mount_type=mount_type,
+            dry_run=True,
+            confirm=False,
+        )
         return _to_output(_as_preview(result), BootPatchOutput)
     if not confirm:
         return _refuse_confirm(BootPatchOutput, "CRITICAL")
-    result = ops.patch_boot_image(boot_path, method=method, dry_run=False, confirm=True)
-    return _to_output(
-        result,
-        BootPatchOutput,
-        data={
-            "success": result.success,
-            "patched_path": None,
-            "method": method,
-            "sha256": None,
-        },
+    result = ops.patch_boot_image(
+        boot_path,
+        method=method,
+        apk_path=apk_path,
+        superkey=superkey,
+        kmi_override=kmi_override,
+        mount_type=mount_type,
+        dry_run=False,
+        confirm=True,
     )
+    return _to_output(result, BootPatchOutput)
 
 
 @mcp.tool()
