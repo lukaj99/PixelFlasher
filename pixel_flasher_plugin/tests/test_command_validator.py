@@ -53,6 +53,44 @@ def test_injection_vector_is_blocked(cmd: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# avbtool host-command injection vectors -- these MUST all be DENIED
+# ---------------------------------------------------------------------------
+AVBTOOL_INJECTION_VECTORS = [
+    pytest.param(
+        "avbtool add_hash_footer --image /tmp/boot.img; rm -rf /",
+        id="avbtool-semicolon-chain",
+    ),
+    pytest.param(
+        "avbtool add_hash_footer --image /tmp/boot.img | cat",
+        id="avbtool-pipe",
+    ),
+    pytest.param(
+        "avbtool add_hash_footer --image /tmp/boot.img\nrm -rf /",
+        id="avbtool-newline-chain",
+    ),
+    pytest.param(
+        "avbtool add_hash_footer --image $(rm -rf /) --partition_name boot",
+        id="avbtool-command-substitution",
+    ),
+    pytest.param(
+        "avbtool erase --image /tmp/boot.img",
+        id="avbtool-unknown-subcommand",
+    ),
+]
+
+
+@pytest.mark.parametrize("cmd", AVBTOOL_INJECTION_VECTORS)
+def test_avbtool_injection_vector_is_blocked(cmd: str) -> None:
+    """Host-side avbtool patterns must still reject injection and unknown subs."""
+    allowed, reason = CommandValidator.is_allowed(cmd)
+    assert allowed is False, (
+        f"AVBTOOL INJECTION VECTOR ALLOWED: {cmd!r}\n"
+        f"This would let an agent chain arbitrary host shell commands."
+    )
+    assert reason, f"Denial reason is empty for {cmd!r}"
+
+
+# ---------------------------------------------------------------------------
 # Legit commands -- these MUST be ALLOWED
 # ---------------------------------------------------------------------------
 LEGIT_COMMANDS = [
@@ -63,6 +101,13 @@ LEGIT_COMMANDS = [
     pytest.param(
         "fastboot -s FAKE001 getvar product",
         id="fastboot-getvar-product",
+    ),
+    pytest.param(
+        "avbtool add_hash_footer --image /tmp/boot.img "
+        "--dynamic_partition_size --partition_name boot "
+        "--hash_algorithm sha256 --algorithm SHA256_RSA4096 "
+        "--key /tmp/testkey.pem",
+        id="avbtool-add-hash-footer",
     ),
 ]
 

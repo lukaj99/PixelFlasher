@@ -41,6 +41,16 @@ class CommandValidator:
         re.compile(r"^fastboot\s+-s\s+\S+\s+oem\s+\S+$"),
     ]
 
+    # Host-side tools whose command string is used only for audit logging; the
+    # actual work is performed by an in-process Python call.  The regexes are
+    # anchored and tokenized so shell metacharacters cannot slip through.
+    ALLOWED_HOST_COMMANDS = [
+        re.compile(
+            r"^avbtool\s+add_hash_footer"
+            r"(?:\s+--\w+(?:\s+\S+)?)*$"
+        ),
+    ]
+
     BLOCKED_PARTITIONS = {
         "xbl",
         "xbl_config",
@@ -101,7 +111,12 @@ class CommandValidator:
                     matched = True
                     break
         if not matched:
-            return False, "Command does not match the ADB/fastboot whitelist."
+            for pattern in cls.ALLOWED_HOST_COMMANDS:
+                if pattern.match(stripped):
+                    matched = True
+                    break
+        if not matched:
+            return False, "Command does not match the command whitelist."
 
         # For flash/erase commands, extract and validate the partition name.
         partition = cls._extract_partition(stripped)

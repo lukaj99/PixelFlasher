@@ -767,6 +767,48 @@ class TestAvbSignImage:
         assert kwargs["algorithm_name"] == "SHA256_RSA4096"
         assert kwargs["key_path"] == str(key)
 
+    def test_confirm_path_uses_real_safety_gateway(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        """avb_sign_image(confirm=True) must pass a real SafetyGateway.
+
+        The command string is only used for audit logging; the actual signing
+        is an in-process Python call.  A real gateway must therefore ALLOW the
+        confirm path instead of DENY'ing the avbtool command as if it were an
+        unknown ADB/fastboot command.
+        """
+        ops = DeviceOps(device_id="FAKE001")
+        assert isinstance(ops.gateway, SafetyGateway)
+
+        img = tmp_path / "boot.img"
+        img.write_bytes(b"\x00" * 64)
+        key = tmp_path / "testkey_rsa4096.pem"
+        key.write_bytes(b"fake key material")
+
+        fake_avbtool = MagicMock()
+
+        class _AvbError(Exception):
+            pass
+
+        fake_avbtool.AvbError = _AvbError
+        fake_tool = MagicMock()
+        fake_avbtool.AvbTool.return_value = fake_tool
+        monkeypatch.setitem(sys.modules, "avbtool", fake_avbtool)
+
+        result = ops.avb_sign_image(
+            str(img), str(key), algorithm="SHA256_RSA4096", confirm=True
+        )
+
+        assert result.success is True
+        data = result.data or {}
+        assert data["signed_path"] == str(tmp_path / "boot.signed.img")
+        assert data["algorithm"] == "SHA256_RSA4096"
+        fake_tool.add_hash_footer.assert_called_once()
+        kwargs = fake_tool.add_hash_footer.call_args.kwargs
+        assert kwargs["partition_name"] == "boot"
+        assert kwargs["algorithm_name"] == "SHA256_RSA4096"
+        assert kwargs["key_path"] == str(key)
+
     def test_avbtool_error_returns_structured_failure(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path
     ) -> None:
