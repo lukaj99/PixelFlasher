@@ -5039,9 +5039,9 @@ add_hosts_module
                 puml(f"note right:{dirname};\n")
                 if "kernelsu" in self.su_version.lower():
                     theCmd = f"\"{get_adb()}\" -s {self.id} shell \"su -c \'ksud module uninstall {dirname}\'\""
-                if "sukisu" in self.su_version.lower():
+                elif "sukisu" in self.su_version.lower():
                     theCmd = f"\"{get_adb()}\" -s {self.id} shell \"su -c \'ksud module uninstall {dirname}\'\""
-                if "wild_ksu" in self.su_version.lower():
+                elif "wild_ksu" in self.su_version.lower():
                     theCmd = f"\"{get_adb()}\" -s {self.id} shell \"su -c \'ksud module uninstall {dirname}\'\""
                 elif "apatch" in self.su_version.lower():
                     theCmd = f"\"{get_adb()}\" -s {self.id} shell \"su -c \'apd module uninstall {dirname}\'\""
