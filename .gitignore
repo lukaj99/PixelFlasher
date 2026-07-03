@@ -151,3 +151,10 @@ desktop.ini
 tools/
 data/
 
+# Local tool/agent working state (not project source)
+.claude/
+.code-context/
+.remember/
+.store/
+devices.json
+
