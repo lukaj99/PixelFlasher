@@ -52,6 +52,13 @@ OSM0SIS_PIF_UPDATE_URL = 'https://raw.githubusercontent.com/osm0sis/PlayIntegrit
 TRICKYSTORE_UPDATE_URL = 'https://raw.githubusercontent.com/5ec1cff/TrickyStore/main/update.json' # non-existent, just a placeholder
 TARGETEDFIX_UPDATE_URL = 'https://raw.githubusercontent.com/VisionR1/TargetedFix/main/update.json'
 PIF_JSON_PATH = '/data/adb/pif.json'
+NEO_BACKUP_PACKAGE = 'com.machiav3lli.backup'
+NEO_BACKUP_RELEASES_API = 'https://api.github.com/repos/NeoApplications/Neo-Backup/releases/latest'
+NEO_BACKUP_COMMAND_RECEIVER = 'com.machiav3lli.backup/.manager.services.CommandReceiver'
+NEO_BACKUP_LAUNCHER_ACTIVITY = 'com.machiav3lli.backup/.ui.activities.NeoActivity'
+NEO_BACKUP_DB_PATH = '/data/data/com.machiav3lli.backup/databases/main.db'
+SWIFT_BACKUP_PACKAGE = 'org.swiftapps.swiftbackup'
+SWIFT_BACKUP_SHORTCUTS_ACTIVITY = 'org.swiftapps.swiftbackup/.shortcuts.ShortcutsActivity'
 XIAOMI_URL = "https://sourceforge.net/projects/xiaomi-eu-multilang-miui-roms/rss?path=/xiaomi.eu/Xiaomi.eu-app"
 FREEMANURL = "https://codeload.github.com/TheFreeman193/PIFS/zip/refs/heads/main"
 SCRCPYURL = "https://github.com/Genymobile/scrcpy/releases/latest"

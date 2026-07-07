@@ -14,6 +14,7 @@ import os
 import re
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import time
@@ -22,7 +23,8 @@ import zipfile
 from datetime import datetime, timezone
 from typing import Any, ClassVar
 
-from pixel_flasher_plugin import boot_patcher, command_validator, telemetry
+import constants
+from pixel_flasher_plugin import app_backup, boot_patcher, command_validator, package_backup, telemetry
 from pixel_flasher_plugin.headless_runtime import bootstrap, get_device
 from pixel_flasher_plugin.headless_runtime import runtime as _runtime
 from pixel_flasher_plugin.headless_runtime import run_shell as _run_shell
@@ -1494,6 +1496,530 @@ class DeviceOps:
         except Exception as exc:
             self._log("install_apk", None, False)
             return self._tool_error("install_apk", exc)
+
+    # ------------------------------------------------------------------
+    # App+data backup tooling (Neo Backup / Swift Backup)
+    # ------------------------------------------------------------------
+    def get_backup_tool_release(self, app: str = "neo_backup") -> ToolResult:
+        """Fetch the latest release metadata for a supported backup app.
+
+        Only ``neo_backup`` has a public GitHub release feed. ``swift_backup``
+        is closed-source with no public release API -- callers must supply
+        their own APK path to :meth:`install_backup_tool` for that app.
+        """
+        try:
+            if app not in app_backup.SUPPORTED_APPS:
+                return ToolResult(success=False, error=f"Unsupported app: {app!r}")
+            if app != "neo_backup":
+                return ToolResult(
+                    success=False,
+                    error=f"{app} has no public release API; supply apk_path directly",
+                )
+            release = app_backup.fetch_neo_backup_latest_release()
+            self._log("get_backup_tool_release", None, True)
+            return ToolResult(success=True, data=release)
+        except Exception as exc:
+            self._log("get_backup_tool_release", None, False)
+            return self._tool_error("get_backup_tool_release", exc)
+
+    def install_backup_tool(
+        self,
+        app: str = "neo_backup",
+        apk_path: str | None = None,
+        confirm: bool = False,
+    ) -> ToolResult:
+        """Fetch (if needed) and install a backup app's APK.
+
+        For ``neo_backup`` with no ``apk_path``, the latest GitHub release is
+        downloaded to a temp directory first. ``swift_backup`` always
+        requires an explicit ``apk_path`` (closed-source, no release feed).
+        """
+        if app not in app_backup.SUPPORTED_APPS:
+            return ToolResult(success=False, error=f"Unsupported app: {app!r}")
+
+        resolved_path = apk_path
+        if resolved_path is None:
+            if app != "neo_backup":
+                return ToolResult(
+                    success=False,
+                    error=f"{app} requires an explicit apk_path (no public release feed)",
+                )
+            try:
+                release = app_backup.fetch_neo_backup_latest_release()
+                tmp_dir = tempfile.mkdtemp(prefix="neo_backup_")
+                resolved_path = app_backup.download_apk(
+                    release["apk_url"], tmp_dir, release["apk_name"]
+                )
+            except Exception as exc:
+                self._log("install_backup_tool", None, False)
+                return self._tool_error("install_backup_tool", exc)
+
+        return self.install_apk(resolved_path, confirm=confirm)
+
+    def trigger_app_backup(
+        self,
+        app: str,
+        schedule_name: str | None = None,
+        schedule_ids: list[str] | None = None,
+        confirm: bool = False,
+    ) -> ToolResult:
+        """Trigger a pre-configured backup schedule on an installed backup app.
+
+        Neither app supports an ad-hoc single-package backup -- the schedule
+        itself (which packages, what mode, recurrence) must already exist,
+        created once via the app's own UI. This only fires an existing
+        schedule: ``schedule_name`` for neo_backup (required), or
+        ``schedule_ids`` for swift_backup (omit to run all enabled schedules).
+        """
+        try:
+            subcommand_body = app_backup.build_trigger_command(
+                app, schedule_name=schedule_name, schedule_ids=schedule_ids
+            )
+        except ValueError as exc:
+            return ToolResult(success=False, error=str(exc))
+
+        subcommand = f"shell {subcommand_body}"
+        command = self._adb_cmd(subcommand)
+        blocked = self._evaluate(command, RiskTier.WARN, confirm)
+        if blocked:
+            self._log("trigger_app_backup", command, False)
+            return blocked
+
+        preflight = self._run_preflight(RiskTier.WARN, expected_mode="adb")
+        if preflight:
+            self._log("trigger_app_backup", command, False)
+            return preflight
+
+        try:
+            exec_cmd = self._exec_adb_cmd(subcommand)
+            res = self._run_shell_safe(exec_cmd, timeout=30)
+            success = res.returncode == 0
+            self._log("trigger_app_backup", command, success)
+            if not success:
+                return ToolResult(
+                    success=False,
+                    error=f"trigger failed (exit {res.returncode}): {res.stderr}",
+                    command=command,
+                )
+            return ToolResult(
+                success=True,
+                data={"app": app, "schedule_name": schedule_name, "schedule_ids": schedule_ids},
+                command=command,
+            )
+        except Exception as exc:
+            self._log("trigger_app_backup", None, False)
+            return self._tool_error("trigger_app_backup", exc)
+
+    def get_app_backup_status(self, app: str) -> ToolResult:
+        """Check whether a backup app is installed, and its version if so."""
+        try:
+            package = app_backup.package_for(app)
+        except ValueError as exc:
+            return ToolResult(success=False, error=str(exc))
+
+        try:
+            dev = self._lazy_device()
+            output = dev.get_package_list("all")
+            installed = bool(output) and any(
+                line.strip() == f"package:{package}" for line in output.splitlines()
+            )
+
+            version = None
+            if installed:
+                subcommand = f"shell dumpsys package {self._q(package)}"
+                exec_cmd = self._exec_adb_cmd(subcommand)
+                res = self._run_shell_safe(exec_cmd, timeout=15)
+                if res.returncode == 0:
+                    for line in res.stdout.splitlines():
+                        stripped = line.strip()
+                        if stripped.startswith("versionName="):
+                            version = stripped.split("=", 1)[1]
+                            break
+
+            self._log("get_app_backup_status", None, True)
+            return ToolResult(
+                success=True,
+                data={"app": app, "package": package, "installed": installed, "version": version},
+            )
+        except Exception as exc:
+            self._log("get_app_backup_status", None, False)
+            return self._tool_error("get_app_backup_status", exc)
+
+    def create_backup_schedule(
+        self,
+        app: str,
+        name: str,
+        packages: list[str] | None = None,
+        block_packages: list[str] | None = None,
+        time_hour: int = 12,
+        time_minute: int = 0,
+        interval_days: int = 1,
+        mode: int | None = None,
+        enabled: bool = True,
+        confirm: bool = False,
+    ) -> ToolResult:
+        """Create a backup schedule by inserting directly into Neo Backup's DB.
+
+        Only ``neo_backup`` is supported. Its Room DB schema (17-column
+        Schedule table, mode/filter bit flags, comma-joined package-set
+        serialization) was verified empirically against a real on-device
+        ``main.db`` -- not the possibly-stale exported schema JSON in the
+        upstream repo. ``swift_backup``'s schedule storage format is
+        closed-source/obfuscated and unconfirmed, so it isn't supported here.
+
+        This force-stops the app, pulls its database (+ WAL/SHM if present),
+        inserts the new row locally via sqlite3, checkpoints WAL into the
+        main file, pushes the merged database back with the original
+        ownership/permissions restored, then relaunches the app once so its
+        own scheduling engine (WorkManager) picks up the new row -- a raw DB
+        insert alone does not register a running job.
+        """
+        if app != "neo_backup":
+            return ToolResult(
+                success=False,
+                error=(
+                    f"create_backup_schedule only supports neo_backup (got {app!r}); "
+                    "swift_backup's schedule DB format is unconfirmed (closed source)"
+                ),
+            )
+
+        try:
+            sql, params = app_backup.build_schedule_insert_sql(
+                name,
+                packages=packages,
+                block_packages=block_packages,
+                time_hour=time_hour,
+                time_minute=time_minute,
+                interval_days=interval_days,
+                mode=mode if mode is not None else app_backup.NB_MODE_APK_AND_DATA,
+                enabled=enabled,
+                now_millis=int(time.time() * 1000),
+            )
+        except ValueError as exc:
+            return ToolResult(success=False, error=str(exc))
+
+        package = constants.NEO_BACKUP_PACKAGE
+        db_path = constants.NEO_BACKUP_DB_PATH
+
+        stop_subcommand = f"shell am force-stop {self._q(package)}"
+        command = self._adb_cmd(stop_subcommand)
+        blocked = self._evaluate(command, RiskTier.WARN, confirm)
+        if blocked:
+            self._log("create_backup_schedule", command, False)
+            return blocked
+
+        preflight = self._run_preflight(RiskTier.WARN, expected_mode="adb")
+        if preflight:
+            self._log("create_backup_schedule", command, False)
+            return preflight
+
+        local_dir = tempfile.mkdtemp(prefix="pf_nb_schedule_")
+        stage_dir = "/data/local/tmp/pf_nb_stage"
+        try:
+            res = self._run_shell_safe(self._exec_adb_cmd(stop_subcommand), timeout=15)
+            if res.returncode != 0:
+                self._log("create_backup_schedule", command, False)
+                return ToolResult(
+                    success=False,
+                    error=f"force-stop failed (exit {res.returncode}): {res.stderr}",
+                    command=command,
+                )
+
+            stat_cmd = self._exec_adb_cmd(
+                f"shell su -c \"stat -c '%u:%g:%a' {self._q(db_path)}\""
+            )
+            res = self._run_shell_safe(stat_cmd, timeout=15)
+            if res.returncode != 0 or not res.stdout.strip():
+                self._log("create_backup_schedule", command, False)
+                return ToolResult(
+                    success=False,
+                    error=f"could not stat {db_path} (is neo_backup installed and has it been opened once?): {res.stderr}",
+                    command=command,
+                )
+            owner_uid, owner_gid, owner_mode = res.stdout.strip().split(":")
+
+            stage_cmd = self._exec_adb_cmd(
+                f'shell su -c "mkdir -p {self._q(stage_dir)} && '
+                f"cp {self._q(db_path)} {self._q(stage_dir)}/main.db && "
+                f"(cp {self._q(db_path)}-wal {self._q(stage_dir)}/main.db-wal 2>/dev/null || true) && "
+                f"(cp {self._q(db_path)}-shm {self._q(stage_dir)}/main.db-shm 2>/dev/null || true) && "
+                f'chmod 644 {self._q(stage_dir)}/main.db*"'
+            )
+            res = self._run_shell_safe(stage_cmd, timeout=30)
+            if res.returncode != 0:
+                self._log("create_backup_schedule", command, False)
+                return ToolResult(
+                    success=False,
+                    error=f"failed to stage database for pull: {res.stderr}",
+                    command=command,
+                )
+
+            for suffix in ("main.db", "main.db-wal", "main.db-shm"):
+                pull_cmd = self._exec_adb_cmd(f"pull {stage_dir}/{suffix} {self._q(local_dir)}/{suffix}")
+                self._run_shell_safe(pull_cmd, timeout=30)  # wal/shm may legitimately not exist
+
+            local_db = os.path.join(local_dir, "main.db")
+            if not os.path.isfile(local_db):
+                self._log("create_backup_schedule", command, False)
+                return ToolResult(success=False, error="failed to pull main.db from device", command=command)
+
+            conn = sqlite3.connect(local_db)
+            try:
+                cur = conn.cursor()
+                cur.execute(sql, params)
+                conn.commit()
+                new_id = cur.lastrowid
+                cur.execute("PRAGMA wal_checkpoint(FULL)")
+                conn.commit()
+            finally:
+                conn.close()
+
+            push_cmd = self._exec_adb_cmd(f"push {self._q(local_db)} {stage_dir}/main.db")
+            res = self._run_shell_safe(push_cmd, timeout=30)
+            if res.returncode != 0:
+                self._log("create_backup_schedule", command, False)
+                return ToolResult(
+                    success=False,
+                    error=f"failed to push modified database back to device: {res.stderr}",
+                    command=command,
+                )
+
+            replace_cmd = self._exec_adb_cmd(
+                f'shell su -c "cp {self._q(stage_dir)}/main.db {self._q(db_path)} && '
+                f"rm -f {self._q(db_path)}-wal {self._q(db_path)}-shm && "
+                f"chown {owner_uid}:{owner_gid} {self._q(db_path)} && "
+                f'chmod {owner_mode} {self._q(db_path)} && '
+                f'rm -rf {self._q(stage_dir)}"'
+            )
+            res = self._run_shell_safe(replace_cmd, timeout=30)
+            if res.returncode != 0:
+                self._log("create_backup_schedule", command, False)
+                return ToolResult(
+                    success=False,
+                    error=(
+                        f"failed to restore modified database in place: {res.stderr}. "
+                        f"Original database is untouched (only the staged copy at {stage_dir} may be stale)."
+                    ),
+                    command=command,
+                )
+
+            relaunch_cmd = self._exec_adb_cmd(f"shell am start -n {constants.NEO_BACKUP_LAUNCHER_ACTIVITY}")
+            self._run_shell_safe(relaunch_cmd, timeout=15)
+
+            self._log("create_backup_schedule", command, True)
+            return ToolResult(
+                success=True,
+                data={"app": app, "schedule_id": new_id, "name": name},
+                command=command,
+            )
+        except Exception as exc:
+            self._log("create_backup_schedule", None, False)
+            return self._tool_error("create_backup_schedule", exc)
+        finally:
+            shutil.rmtree(local_dir, ignore_errors=True)
+
+    def backup_app_data(
+        self,
+        package: str,
+        dest_dir: str,
+        include_external: bool = False,
+        include_obb: bool = False,
+        confirm: bool = False,
+    ) -> ToolResult:
+        """Back up an installed package's private data directly via root tar.
+
+        App-independent -- no Neo Backup/Swift Backup dependency. Covers
+        /data/data/<pkg> and /data/user_de/0/<pkg> (where session tokens,
+        SharedPreferences, and SQLite databases actually live), optionally
+        external app storage/OBB. The APK itself is out of scope -- see
+        install_apk/install_package. Force-stops the app first so the tar
+        isn't reading data mid-write.
+        """
+        try:
+            package_backup.validate_package_name(package)
+        except ValueError as exc:
+            return ToolResult(success=False, error=str(exc))
+
+        stop_subcommand = f"shell am force-stop {self._q(package)}"
+        command = self._adb_cmd(stop_subcommand)
+        blocked = self._evaluate(command, RiskTier.WARN, confirm)
+        if blocked:
+            self._log("backup_app_data", command, False)
+            return blocked
+
+        preflight = self._run_preflight(RiskTier.WARN, expected_mode="adb")
+        if preflight:
+            self._log("backup_app_data", command, False)
+            return preflight
+
+        remote_tar = f"/data/local/tmp/pf_{package}_backup.tar"
+        remote_script = f"/data/local/tmp/pf_{package}_backup.sh"
+        local_script = tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False).name
+        try:
+            res = self._run_shell_safe(self._exec_adb_cmd(stop_subcommand), timeout=15)
+            if res.returncode != 0:
+                self._log("backup_app_data", command, False)
+                return ToolResult(success=False, error=f"force-stop failed: {res.stderr}", command=command)
+
+            script = package_backup.build_backup_script(
+                package, remote_tar, include_external=include_external, include_obb=include_obb
+            )
+            with open(local_script, "w", encoding="utf-8") as f:
+                f.write(script)
+
+            push_cmd = self._exec_adb_cmd(f"push {self._q(local_script)} {self._q(remote_script)}")
+            res = self._run_shell_safe(push_cmd, timeout=30)
+            if res.returncode != 0:
+                self._log("backup_app_data", command, False)
+                return ToolResult(success=False, error=f"failed to push backup script: {res.stderr}", command=command)
+
+            chmod_cmd = self._exec_adb_cmd(f"shell chmod 755 {self._q(remote_script)}")
+            res = self._run_shell_safe(chmod_cmd, timeout=15)
+            if res.returncode != 0:
+                self._log("backup_app_data", command, False)
+                return ToolResult(success=False, error=f"failed to chmod backup script: {res.stderr}", command=command)
+
+            tar_cmd = self._exec_adb_cmd(f"shell su -c {self._q(remote_script)}")
+            res = self._run_shell_safe(tar_cmd, timeout=120)
+            self._run_shell_safe(self._exec_adb_cmd(f"shell rm -f {self._q(remote_script)}"), timeout=15)
+            if res.returncode != 0:
+                self._log("backup_app_data", command, False)
+                return ToolResult(
+                    success=False,
+                    error=f"tar backup failed (exit {res.returncode}): {res.stderr}",
+                    command=command,
+                )
+
+            os.makedirs(dest_dir, exist_ok=True)
+            local_path = os.path.join(dest_dir, f"{package}_backup.tar")
+            pull_cmd = self._exec_adb_cmd(f"pull {remote_tar} {self._q(local_path)}")
+            res = self._run_shell_safe(pull_cmd, timeout=120)
+            self._run_shell_safe(self._exec_adb_cmd(f"shell su -c {self._q(f'rm -f {remote_tar}')}"), timeout=15)
+            if res.returncode != 0 or not os.path.isfile(local_path):
+                self._log("backup_app_data", command, False)
+                return ToolResult(success=False, error=f"failed to pull backup tar: {res.stderr}", command=command)
+
+            self._log("backup_app_data", command, True)
+            return ToolResult(
+                success=True,
+                data={"package": package, "local_path": local_path, "size_bytes": os.path.getsize(local_path)},
+                command=command,
+            )
+        except Exception as exc:
+            self._log("backup_app_data", None, False)
+            return self._tool_error("backup_app_data", exc)
+        finally:
+            try:
+                os.remove(local_script)
+            except OSError:
+                pass
+
+    def restore_app_data(
+        self,
+        package: str,
+        tar_path: str,
+        include_external: bool = False,
+        include_obb: bool = False,
+        confirm: bool = False,
+    ) -> ToolResult:
+        """Restore a package's private data from a backup_app_data tar.
+
+        The app must already be installed (this restores data only, not
+        the APK -- use install_apk/install_package first if needed). Reads
+        the app's *current* UID live via stat and chowns extracted files to
+        match -- restoring with a stale/wrong UID is the standard way a
+        manual Android data restore silently breaks an app.
+        """
+        try:
+            package_backup.validate_package_name(package)
+        except ValueError as exc:
+            return ToolResult(success=False, error=str(exc))
+
+        resolved_tar = os.path.abspath(os.path.expanduser(tar_path))
+        if not os.path.isfile(resolved_tar):
+            return ToolResult(success=False, error=f"Backup tar not found: {resolved_tar}")
+
+        stop_subcommand = f"shell am force-stop {self._q(package)}"
+        command = self._adb_cmd(stop_subcommand)
+        blocked = self._evaluate(command, RiskTier.WARN, confirm)
+        if blocked:
+            self._log("restore_app_data", command, False)
+            return blocked
+
+        preflight = self._run_preflight(RiskTier.WARN, expected_mode="adb")
+        if preflight:
+            self._log("restore_app_data", command, False)
+            return preflight
+
+        remote_tar = f"/data/local/tmp/pf_{package}_restore.tar"
+        remote_script = f"/data/local/tmp/pf_{package}_restore.sh"
+        local_script = tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False).name
+        try:
+            res = self._run_shell_safe(self._exec_adb_cmd(stop_subcommand), timeout=15)
+            if res.returncode != 0:
+                self._log("restore_app_data", command, False)
+                return ToolResult(success=False, error=f"force-stop failed: {res.stderr}", command=command)
+
+            stat_cmd = self._exec_adb_cmd(
+                f"shell su -c \"stat -c '%u:%g' /data/data/{self._q(package)}\""
+            )
+            res = self._run_shell_safe(stat_cmd, timeout=15)
+            if res.returncode != 0 or not res.stdout.strip():
+                self._log("restore_app_data", command, False)
+                return ToolResult(
+                    success=False,
+                    error=f"could not stat current app data dir (is {package} installed?): {res.stderr}",
+                    command=command,
+                )
+            uid, gid = res.stdout.strip().split(":")
+
+            push_cmd = self._exec_adb_cmd(f"push {self._q(resolved_tar)} {remote_tar}")
+            res = self._run_shell_safe(push_cmd, timeout=120)
+            if res.returncode != 0:
+                self._log("restore_app_data", command, False)
+                return ToolResult(success=False, error=f"failed to push backup tar: {res.stderr}", command=command)
+
+            script = package_backup.build_restore_script(
+                package, remote_tar, uid, gid, include_external=include_external, include_obb=include_obb
+            )
+            with open(local_script, "w", encoding="utf-8") as f:
+                f.write(script)
+
+            push_script_cmd = self._exec_adb_cmd(f"push {self._q(local_script)} {self._q(remote_script)}")
+            res = self._run_shell_safe(push_script_cmd, timeout=30)
+            if res.returncode != 0:
+                self._log("restore_app_data", command, False)
+                return ToolResult(success=False, error=f"failed to push restore script: {res.stderr}", command=command)
+
+            chmod_cmd = self._exec_adb_cmd(f"shell chmod 755 {self._q(remote_script)}")
+            res = self._run_shell_safe(chmod_cmd, timeout=15)
+            if res.returncode != 0:
+                self._log("restore_app_data", command, False)
+                return ToolResult(success=False, error=f"failed to chmod restore script: {res.stderr}", command=command)
+
+            restore_cmd = self._exec_adb_cmd(f"shell su -c {self._q(remote_script)}")
+            res = self._run_shell_safe(restore_cmd, timeout=120)
+            self._run_shell_safe(
+                self._exec_adb_cmd(f"shell su -c {self._q(f'rm -f {remote_tar} {remote_script}')}"), timeout=15
+            )
+            if res.returncode != 0:
+                self._log("restore_app_data", command, False)
+                return ToolResult(
+                    success=False,
+                    error=f"tar restore failed (exit {res.returncode}): {res.stderr}",
+                    command=command,
+                )
+
+            self._log("restore_app_data", command, True)
+            return ToolResult(success=True, data={"package": package, "uid": uid, "gid": gid}, command=command)
+        except Exception as exc:
+            self._log("restore_app_data", None, False)
+            return self._tool_error("restore_app_data", exc)
+        finally:
+            try:
+                os.remove(local_script)
+            except OSError:
+                pass
 
     def read_partition(
         self,

@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "pixelflasher": {
+      "command": "uv",
+      "args": ["run", "--project", ".", "python", "-m", "pixel_flasher_plugin.mcp_server"],
+      "env": {
+        "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION": "python"
+      }
+    }
+  }
+}

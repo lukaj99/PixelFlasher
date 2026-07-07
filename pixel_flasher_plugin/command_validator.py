@@ -23,6 +23,18 @@ class CommandValidator:
         # Play Integrity live probe: launch checker app, dump UI hierarchy, tap button.
         re.compile(r"^adb\s+-s\s+\S+\s+shell\s+am\s+force-stop\s+\S+$"),
         re.compile(r"^adb\s+-s\s+\S+\s+shell\s+am\s+start\s+-n\s+\S+/\S+$"),
+        # App backup trigger: fire a pre-configured schedule on Neo Backup
+        # (broadcast) or Swift Backup (activity start with a schedule-ids extra).
+        re.compile(
+            r"^adb\s+-s\s+\S+\s+shell\s+am\s+broadcast\s+-a\s+schedule\s+"
+            r'--es\s+name\s+"[\w.\- ]{1,64}"\s+-n\s+'
+            r"com\.machiav3lli\.backup/\.manager\.services\.CommandReceiver$"
+        ),
+        re.compile(
+            r"^adb\s+-s\s+\S+\s+shell\s+am\s+start\s+-n\s+"
+            r'org\.swiftapps\.swiftbackup/\.shortcuts\.ShortcutsActivity\s+'
+            r'-e\s+"cmd"\s+"-s\s+[\w.\- ]{1,64}"$'
+        ),
         re.compile(r"^adb\s+-s\s+\S+\s+shell\s+uiautomator\s+dump\s+\S+$"),
         re.compile(r"^adb\s+-s\s+\S+\s+shell\s+input\s+tap\s+\d+\s+\d+$"),
         # Host-side redirect used by read_partition; partition is sanitized before

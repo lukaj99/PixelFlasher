@@ -23,11 +23,18 @@ from pydantic import BaseModel
 
 from pixel_flasher_plugin.device_ops import DeviceOps
 from pixel_flasher_plugin.output_models import (
+    AppBackupStatusOutput,
+    AppBackupTriggerOutput,
+    AppDataBackupOutput,
+    AppDataRestoreOutput,
     AvbSignOutput,
     AvbVerifyOutput,
     BackupListOutput,
     BackupOutput,
     BackupRestoreOutput,
+    BackupScheduleCreateOutput,
+    BackupToolInstallOutput,
+    BackupToolReleaseOutput,
     BootFlashOutput,
     BootloaderOutput,
     BootPatchOutput,
@@ -296,6 +303,201 @@ def install_package(
             "package": (result.data or {}).get("apk_path") if result.success else None,
         },
     )
+
+
+@mcp.tool()
+def get_backup_tool_release(ctx: Context, device_id: str, app: str = "neo_backup") -> BackupToolReleaseOutput:
+    """Fetch the latest release metadata for a supported app-data backup tool.
+
+    ``app`` is ``neo_backup`` (default, open source, public GitHub releases)
+    or ``swift_backup`` (closed source, no release API -- always returns an
+    error for this tool; supply your own apk_path to install_backup_tool).
+    """
+    result = _ops(device_id, ctx).get_backup_tool_release(app=app)
+    return _to_output(result, BackupToolReleaseOutput)
+
+
+@mcp.tool()
+def install_backup_tool(
+    ctx: Context,
+    device_id: str,
+    app: str = "neo_backup",
+    apk_path: str | None = None,
+    dry_run: bool = True,
+    confirm: bool = False,
+) -> BackupToolInstallOutput:
+    """Fetch (if needed) and install an app+data backup tool. WARN operation.
+
+    For neo_backup with no apk_path, downloads the latest GitHub release
+    first. swift_backup always requires an explicit apk_path (closed
+    source, no release feed -- pull your own licensed copy off the device
+    or supply the APK yourself). Defaults to dry_run=True (preview mode).
+    To execute, pass dry_run=False AND confirm=True.
+    """
+    ops = _ops(device_id, ctx)
+    if dry_run:
+        result = ops.install_backup_tool(app=app, apk_path=apk_path, confirm=False)
+        return _to_output(_as_preview(result), BackupToolInstallOutput)
+    if not confirm:
+        return _refuse_confirm(BackupToolInstallOutput, "WARN")
+    result = ops.install_backup_tool(app=app, apk_path=apk_path, confirm=True)
+    return _to_output(
+        result,
+        BackupToolInstallOutput,
+        data={
+            "success": result.success,
+            "apk_path": (result.data or {}).get("apk_path") if result.success else None,
+        },
+    )
+
+
+@mcp.tool()
+def trigger_app_backup(
+    ctx: Context,
+    device_id: str,
+    app: str,
+    schedule_name: str | None = None,
+    schedule_ids: list[str] | None = None,
+    dry_run: bool = True,
+    confirm: bool = False,
+) -> AppBackupTriggerOutput:
+    """Trigger a pre-configured backup schedule on an installed backup app. WARN operation.
+
+    Neither neo_backup nor swift_backup supports an ad-hoc single-package
+    backup -- the schedule (which packages, what mode, recurrence) must
+    already exist, created once via the app's own UI. This only fires an
+    existing schedule: schedule_name is required for neo_backup; for
+    swift_backup, pass schedule_ids to run specific schedules or omit it to
+    run all enabled schedules. Defaults to dry_run=True (preview mode). To
+    execute, pass dry_run=False AND confirm=True.
+    """
+    ops = _ops(device_id, ctx)
+    if dry_run:
+        result = ops.trigger_app_backup(
+            app, schedule_name=schedule_name, schedule_ids=schedule_ids, confirm=False
+        )
+        return _to_output(_as_preview(result), AppBackupTriggerOutput)
+    if not confirm:
+        return _refuse_confirm(AppBackupTriggerOutput, "WARN")
+    result = ops.trigger_app_backup(
+        app, schedule_name=schedule_name, schedule_ids=schedule_ids, confirm=True
+    )
+    return _to_output(result, AppBackupTriggerOutput)
+
+
+@mcp.tool()
+def get_app_backup_status(ctx: Context, device_id: str, app: str) -> AppBackupStatusOutput:
+    """Check whether a backup app (neo_backup | swift_backup) is installed, and its version."""
+    result = _ops(device_id, ctx).get_app_backup_status(app)
+    return _to_output(result, AppBackupStatusOutput)
+
+
+@mcp.tool()
+def create_backup_schedule(
+    ctx: Context,
+    device_id: str,
+    app: str,
+    name: str,
+    packages: list[str] | None = None,
+    block_packages: list[str] | None = None,
+    time_hour: int = 12,
+    time_minute: int = 0,
+    interval_days: int = 1,
+    mode: int | None = None,
+    enabled: bool = True,
+    dry_run: bool = True,
+    confirm: bool = False,
+) -> BackupScheduleCreateOutput:
+    """Create a backup schedule by inserting directly into Neo Backup's database. WARN operation.
+
+    Only app="neo_backup" is supported -- its Room DB schema was verified
+    empirically against a real device. swift_backup's schedule storage
+    format is closed-source/obfuscated and unconfirmed, so it isn't
+    supported. packages/block_packages are lists of Android package names
+    (omit packages for "all user apps", matching the app's own default).
+    mode defaults to APK+data (bit flags 16|8=24) if not given -- the app's
+    own "Add Schedule" button only sets APK-only (16), which is NOT enough
+    for a seamless-restore use case; pass mode explicitly only if you know
+    the exact bit flags you want (see app_backup.py NB_MODE_* constants).
+    This force-stops neo_backup and relaunches it once as part of the
+    operation. Defaults to dry_run=True (preview mode). To execute, pass
+    dry_run=False AND confirm=True.
+    """
+    ops = _ops(device_id, ctx)
+    kwargs = dict(
+        packages=packages,
+        block_packages=block_packages,
+        time_hour=time_hour,
+        time_minute=time_minute,
+        interval_days=interval_days,
+        mode=mode,
+        enabled=enabled,
+    )
+    if dry_run:
+        result = ops.create_backup_schedule(app, name, confirm=False, **kwargs)
+        return _to_output(_as_preview(result), BackupScheduleCreateOutput)
+    if not confirm:
+        return _refuse_confirm(BackupScheduleCreateOutput, "WARN")
+    result = ops.create_backup_schedule(app, name, confirm=True, **kwargs)
+    return _to_output(result, BackupScheduleCreateOutput)
+
+
+@mcp.tool()
+def backup_app_data(
+    ctx: Context,
+    device_id: str,
+    package: str,
+    dest_dir: str,
+    include_external: bool = False,
+    include_obb: bool = False,
+    dry_run: bool = True,
+    confirm: bool = False,
+) -> AppDataBackupOutput:
+    """Back up an installed package's private data directly via root tar. WARN operation.
+
+    App-independent -- no Neo Backup/Swift Backup needed. Covers
+    /data/data/<package> and /data/user_de/0/<package> (session tokens,
+    SharedPreferences, SQLite databases). Does NOT back up the APK. Defaults
+    to dry_run=True (preview mode). To execute, pass dry_run=False AND
+    confirm=True.
+    """
+    ops = _ops(device_id, ctx)
+    kwargs = dict(include_external=include_external, include_obb=include_obb)
+    if dry_run:
+        result = ops.backup_app_data(package, dest_dir, confirm=False, **kwargs)
+        return _to_output(_as_preview(result), AppDataBackupOutput)
+    if not confirm:
+        return _refuse_confirm(AppDataBackupOutput, "WARN")
+    result = ops.backup_app_data(package, dest_dir, confirm=True, **kwargs)
+    return _to_output(result, AppDataBackupOutput)
+
+
+@mcp.tool()
+def restore_app_data(
+    ctx: Context,
+    device_id: str,
+    package: str,
+    tar_path: str,
+    include_external: bool = False,
+    include_obb: bool = False,
+    dry_run: bool = True,
+    confirm: bool = False,
+) -> AppDataRestoreOutput:
+    """Restore a package's private data from a backup_app_data tar. WARN operation.
+
+    The app must already be installed (data only, not the APK -- use
+    install_apk/install_package first if needed). Defaults to dry_run=True
+    (preview mode). To execute, pass dry_run=False AND confirm=True.
+    """
+    ops = _ops(device_id, ctx)
+    kwargs = dict(include_external=include_external, include_obb=include_obb)
+    if dry_run:
+        result = ops.restore_app_data(package, tar_path, confirm=False, **kwargs)
+        return _to_output(_as_preview(result), AppDataRestoreOutput)
+    if not confirm:
+        return _refuse_confirm(AppDataRestoreOutput, "WARN")
+    result = ops.restore_app_data(package, tar_path, confirm=True, **kwargs)
+    return _to_output(result, AppDataRestoreOutput)
 
 
 @mcp.tool()

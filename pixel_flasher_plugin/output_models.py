@@ -1,4 +1,4 @@
-"""Pydantic BaseModel output schemas for the 36-tool MCP catalog."""
+"""Pydantic BaseModel output schemas for the 43-tool MCP catalog."""
 from __future__ import annotations
 
 from pydantic import BaseModel, Field
@@ -310,6 +310,64 @@ class ModuleStateOutput(BaseModel):
 class ModuleActionOutput(BaseModel):
     success: bool = Field(description="Whether the action script ran")
     module_id: str | None = Field(default=None, description="Module ID")
+    dry_run: bool = Field(default=True, description="Whether this was a dry run")
+    warnings: list[str] = Field(default_factory=list, description="Non-fatal warnings")
+
+
+class BackupToolReleaseOutput(BaseModel):
+    success: bool = Field(description="Whether the release lookup succeeded")
+    version: str | None = Field(default=None, description="Latest release tag/version")
+    apk_name: str | None = Field(default=None, description="Release APK asset filename")
+    apk_url: str | None = Field(default=None, description="Direct download URL for the APK")
+
+
+class BackupToolInstallOutput(BaseModel):
+    success: bool = Field(description="Whether the install succeeded")
+    apk_path: str | None = Field(default=None, description="Local path of the APK that was installed")
+    dry_run: bool = Field(default=True, description="Whether this was a dry run")
+    warnings: list[str] = Field(default_factory=list, description="Non-fatal warnings")
+
+
+class AppBackupTriggerOutput(BaseModel):
+    success: bool = Field(description="Whether the trigger command succeeded")
+    app: str | None = Field(default=None, description="neo_backup | swift_backup")
+    schedule_name: str | None = Field(default=None, description="Schedule name triggered (neo_backup)")
+    schedule_ids: list[str] | None = Field(default=None, description="Schedule IDs triggered (swift_backup)")
+    dry_run: bool = Field(default=True, description="Whether this was a dry run")
+    warnings: list[str] = Field(default_factory=list, description="Non-fatal warnings")
+
+
+class AppBackupStatusOutput(BaseModel):
+    success: bool = Field(description="Whether the status check succeeded")
+    app: str | None = Field(default=None, description="neo_backup | swift_backup")
+    package: str | None = Field(default=None, description="Android package name")
+    installed: bool | None = Field(default=None, description="Whether the app is installed")
+    version: str | None = Field(default=None, description="Installed versionName, if installed")
+
+
+class BackupScheduleCreateOutput(BaseModel):
+    success: bool = Field(description="Whether the schedule was created")
+    app: str | None = Field(default=None, description="neo_backup (only supported app)")
+    schedule_id: int | None = Field(default=None, description="Row ID of the new Schedule")
+    name: str | None = Field(default=None, description="Schedule name")
+    dry_run: bool = Field(default=True, description="Whether this was a dry run")
+    warnings: list[str] = Field(default_factory=list, description="Non-fatal warnings")
+
+
+class AppDataBackupOutput(BaseModel):
+    success: bool = Field(description="Whether the backup succeeded")
+    package: str | None = Field(default=None, description="Android package name")
+    local_path: str | None = Field(default=None, description="Local path of the pulled backup tar")
+    size_bytes: int | None = Field(default=None, description="Size of the backup tar in bytes")
+    dry_run: bool = Field(default=True, description="Whether this was a dry run")
+    warnings: list[str] = Field(default_factory=list, description="Non-fatal warnings")
+
+
+class AppDataRestoreOutput(BaseModel):
+    success: bool = Field(description="Whether the restore succeeded")
+    package: str | None = Field(default=None, description="Android package name")
+    uid: str | None = Field(default=None, description="UID restored files were chowned to")
+    gid: str | None = Field(default=None, description="GID restored files were chowned to")
     dry_run: bool = Field(default=True, description="Whether this was a dry run")
     warnings: list[str] = Field(default_factory=list, description="Non-fatal warnings")
 
