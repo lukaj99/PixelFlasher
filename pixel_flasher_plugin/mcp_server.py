@@ -110,6 +110,15 @@ def _gateway(ctx: Context) -> Any:
     return ctx.request_context.lifespan_context.gateway
 
 
+# A device_id is interpolated into every command string (``adb -s <id> ...``),
+# and those strings are ultimately executed through a shell=True subprocess.
+# Real ADB serials / IP:port transports only ever contain this character set,
+# so validating it here -- the single chokepoint every tool routes through --
+# stops a crafted device_id (e.g. ``x;reboot`` or ``$(reboot)``) from carrying
+# a shell-injection payload into any command.
+_DEVICE_ID_RE = re.compile(r"^[A-Za-z0-9._:-]+$")
+
+
 def _ops(device_id: str, ctx: Context) -> DeviceOps:
     """Return the shared DeviceOps singleton, bound to the requested device ID.
 
@@ -118,6 +127,11 @@ def _ops(device_id: str, ctx: Context) -> DeviceOps:
     every tool call share the same gateway/runtime without constructing a new
     facade per request.
     """
+    if not _DEVICE_ID_RE.match(device_id or ""):
+        raise ValueError(
+            f"Invalid device_id {device_id!r}: only letters, digits, and "
+            f".:_- are allowed (an ADB serial or ip:port)."
+        )
     ops: DeviceOps = ctx.request_context.lifespan_context.device_ops
     if ops.device_id != device_id:
         ops.device_id = device_id
@@ -242,6 +256,8 @@ def wait_for_device(
 ) -> WaitOutput:
     """Block until the device reaches the requested ADB state."""
     ops = _ops(device_id, ctx)
+    if not re.fullmatch(r"[a-z-]+", state):
+        return WaitOutput(success=False, error=f"Invalid state {state!r}")
     started = time.monotonic()
     result = ops.run_shell(
         f"adb -s {device_id} wait-for-{state}",
@@ -514,7 +530,7 @@ def uninstall_package(
     AND confirm=True.
     """
     ops = _ops(device_id, ctx)
-    command = f"adb -s {device_id} uninstall {package_name}"
+    command = f"adb -s {device_id} uninstall {shlex.quote(package_name)}"
     if dry_run:
         result = ops.run_shell(command, confirm=False)
         return _to_output(_as_preview(result), PackageUninstallOutput)
@@ -546,7 +562,7 @@ def enable_package(
     AND confirm=True.
     """
     ops = _ops(device_id, ctx)
-    command = f"adb -s {device_id} shell pm enable {package_name}"
+    command = f"adb -s {device_id} shell pm enable {shlex.quote(package_name)}"
     if dry_run:
         result = ops.run_shell(command, confirm=False)
         return _to_output(_as_preview(result), PackageStateOutput)
@@ -579,7 +595,7 @@ def disable_package(
     AND confirm=True.
     """
     ops = _ops(device_id, ctx)
-    command = f"adb -s {device_id} shell pm disable-user {package_name}"
+    command = f"adb -s {device_id} shell pm disable-user {shlex.quote(package_name)}"
     if dry_run:
         result = ops.run_shell(command, confirm=False)
         return _to_output(_as_preview(result), PackageStateOutput)

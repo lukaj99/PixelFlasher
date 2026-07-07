@@ -10,7 +10,7 @@ class CommandValidator:
         re.compile(r"^adb\s+-s\s+\S+\s+shell\s+getprop\s+\S+$"),
         re.compile(r"^adb\s+-s\s+\S+\s+shell\s+pm\s+list\s+packages(\s+-[3sedu])?$"),
         re.compile(r"^adb\s+-s\s+\S+\s+shell\s+pm\s+path\s+\S+$"),
-        re.compile(r"^adb\s+-s\s+\S+\s+shell\s+pm\s+(enable|disable)\s+\S+$"),
+        re.compile(r"^adb\s+-s\s+\S+\s+shell\s+pm\s+(enable|disable-user|disable)\s+\S+$"),
         re.compile(r"^adb\s+-s\s+\S+\s+shell\s+pm\s+(grant|revoke)\s+\S+\s+\S+$"),
         re.compile(r"^adb\s+-s\s+\S+\s+shell\s+dumpsys(\s+\S+)*$"),
         re.compile(r"^adb\s+-s\s+\S+\s+shell\s+logcat(\s+\S+)*$"),
