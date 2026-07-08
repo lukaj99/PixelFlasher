@@ -125,7 +125,7 @@ def headless_bootstrap():
 def mcp_server_module():
     """Import pixel_flasher_plugin.mcp_server once per session.
 
-    Importing this module registers all 43 tools and triggers the
+    Importing this module registers all 46 tools and triggers the
     ``import pixel_flasher_plugin.mcp_resources`` at the bottom of
     mcp_server.py, which adds 7 resources.
     """

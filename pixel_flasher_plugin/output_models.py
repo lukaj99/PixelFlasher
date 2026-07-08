@@ -1,4 +1,4 @@
-"""Pydantic BaseModel output schemas for the 43-tool MCP catalog."""
+"""Pydantic BaseModel output schemas for the 46-tool MCP catalog."""
 from __future__ import annotations
 
 from pydantic import BaseModel, Field
@@ -370,6 +370,33 @@ class AppDataRestoreOutput(BaseModel):
     gid: str | None = Field(default=None, description="GID restored files were chowned to")
     dry_run: bool = Field(default=True, description="Whether this was a dry run")
     warnings: list[str] = Field(default_factory=list, description="Non-fatal warnings")
+
+
+class AppSnapshotOutput(BaseModel):
+    success: bool = Field(description="Whether the snapshot succeeded")
+    packages: list[str] = Field(default_factory=list, description="Packages captured")
+    primary_repo: str | None = Field(default=None, description="Primary restic repository")
+    snapshot_id: str | None = Field(default=None, description="New restic snapshot id")
+    copied: list[dict] = Field(default_factory=list, description="Per-secondary-repo copy results")
+    pruned_repos: list[str] = Field(default_factory=list, description="Repos the retention policy was applied to")
+    dry_run: bool = Field(default=True, description="Whether this was a dry run")
+    warnings: list[str] = Field(default_factory=list, description="Non-fatal warnings")
+
+
+class AppSnapshotRestoreOutput(BaseModel):
+    success: bool = Field(description="Whether every package restored")
+    repo: str | None = Field(default=None, description="restic repository restored from")
+    snapshot: str | None = Field(default=None, description="Snapshot id restored ('latest' or hex)")
+    results: list[dict] = Field(default_factory=list, description="Per-package restore results")
+    dry_run: bool = Field(default=True, description="Whether this was a dry run")
+    warnings: list[str] = Field(default_factory=list, description="Non-fatal warnings")
+
+
+class AppSnapshotListOutput(BaseModel):
+    success: bool = Field(description="Whether the listing succeeded")
+    repo: str | None = Field(default=None, description="restic repository listed")
+    count: int = Field(default=0, description="Number of snapshots")
+    snapshots: list[dict] = Field(default_factory=list, description="Snapshot summaries (id, time, tags, paths)")
 
 
 class ToolErrorOutput(BaseModel):

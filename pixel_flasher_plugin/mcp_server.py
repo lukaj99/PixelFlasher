@@ -1,6 +1,6 @@
 """PixelFlasher MCP server adapter.
 
-This module exposes the PixelFlasher device-operation facade as 43 MCP tools
+This module exposes the PixelFlasher device-operation facade as 46 MCP tools
 that AI agents can call.  It bootstraps the headless runtime once at startup
 and shares the same SafetyGateway across all tool invocations.
 """
@@ -27,6 +27,9 @@ from pixel_flasher_plugin.output_models import (
     AppBackupTriggerOutput,
     AppDataBackupOutput,
     AppDataRestoreOutput,
+    AppSnapshotListOutput,
+    AppSnapshotOutput,
+    AppSnapshotRestoreOutput,
     AvbSignOutput,
     AvbVerifyOutput,
     BackupListOutput,
@@ -514,6 +517,96 @@ def restore_app_data(
         return _refuse_confirm(AppDataRestoreOutput, "WARN")
     result = ops.restore_app_data(package, tar_path, confirm=True, **kwargs)
     return _to_output(result, AppDataRestoreOutput)
+
+
+@mcp.tool()
+def snapshot_app_data(
+    ctx: Context,
+    device_id: str,
+    packages: list[str],
+    primary_repo: str,
+    copy_repos: list[str] | None = None,
+    tags: list[str] | None = None,
+    keep_daily: int = 7,
+    keep_weekly: int = 5,
+    keep_monthly: int = 12,
+    include_external: bool = False,
+    include_obb: bool = False,
+    dry_run: bool = True,
+    confirm: bool = False,
+) -> AppSnapshotOutput:
+    """Incremental/dedup/encrypted snapshot of app data into restic. WARN operation.
+
+    Pulls each package's private data (reusing backup_app_data) into a staging
+    dir, then `restic backup` commits it to primary_repo, `restic copy`
+    replicates to each copy_repos entry (dedup-preserving 3-2-1), and
+    `restic forget --prune` applies keep-daily/weekly/monthly retention to every
+    repo. restic/rclone run on the HOST (Mac/VPS), not the phone.
+
+    Repo specs: a local abs path, `rclone:remote:path` (e.g.
+    rclone:gdrive:backups/pixel), or `sftp:user@host:/path`. restic reads its
+    password from RESTIC_PASSWORD_COMMAND / RESTIC_FROM_PASSWORD_COMMAND in the
+    environment (set to a bw-wrapper call) -- never passed as a parameter. Repos
+    must be pre-initialised; copy targets need `init --copy-chunker-params` (see
+    pixel_flasher_plugin/README.md). Defaults to dry_run=True; to execute pass
+    dry_run=False AND confirm=True.
+    """
+    ops = _ops(device_id, ctx)
+    kwargs = dict(
+        copy_repos=copy_repos, tags=tags, keep_daily=keep_daily,
+        keep_weekly=keep_weekly, keep_monthly=keep_monthly,
+        include_external=include_external, include_obb=include_obb,
+    )
+    if dry_run:
+        result = ops.snapshot_app_data(packages, primary_repo, confirm=False, **kwargs)
+        return _to_output(_as_preview(result), AppSnapshotOutput)
+    if not confirm:
+        return _refuse_confirm(AppSnapshotOutput, "WARN")
+    result = ops.snapshot_app_data(packages, primary_repo, confirm=True, **kwargs)
+    return _to_output(result, AppSnapshotOutput)
+
+
+@mcp.tool()
+def restore_from_snapshot(
+    ctx: Context,
+    device_id: str,
+    packages: list[str],
+    repo: str,
+    snapshot: str = "latest",
+    include_external: bool = False,
+    include_obb: bool = False,
+    dry_run: bool = True,
+    confirm: bool = False,
+) -> AppSnapshotRestoreOutput:
+    """Restore app data from a restic snapshot back onto the device. WARN operation.
+
+    `restic restore` recreates the staged .tar files, then each is pushed via
+    the verified restore_app_data (push + chown + SELinux). Apps must already be
+    installed (data only, not the APK). snapshot is 'latest' or a hex id (see
+    list_app_snapshots). Defaults to dry_run=True; to execute pass dry_run=False
+    AND confirm=True.
+    """
+    ops = _ops(device_id, ctx)
+    kwargs = dict(snapshot=snapshot, include_external=include_external, include_obb=include_obb)
+    if dry_run:
+        result = ops.restore_from_snapshot(packages, repo, confirm=False, **kwargs)
+        return _to_output(_as_preview(result), AppSnapshotRestoreOutput)
+    if not confirm:
+        return _refuse_confirm(AppSnapshotRestoreOutput, "WARN")
+    result = ops.restore_from_snapshot(packages, repo, confirm=True, **kwargs)
+    return _to_output(result, AppSnapshotRestoreOutput)
+
+
+@mcp.tool()
+def list_app_snapshots(ctx: Context, device_id: str, repo: str) -> AppSnapshotListOutput:
+    """List restic snapshots in a repo (read-only, runs restic on the host).
+
+    Returns each snapshot's short id, time, tags, and paths. Use the id with
+    restore_from_snapshot. device_id is accepted for interface consistency but
+    the command touches only the host restic repo, not the phone.
+    """
+    result = _ops(device_id, ctx).list_app_snapshots(repo)
+    return _to_output(result, AppSnapshotListOutput)
 
 
 @mcp.tool()

@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from typing import Any, ClassVar
 
 import constants
-from pixel_flasher_plugin import app_backup, boot_patcher, command_validator, package_backup, telemetry
+from pixel_flasher_plugin import app_backup, boot_patcher, command_validator, package_backup, restic_backup, telemetry
 from pixel_flasher_plugin.headless_runtime import bootstrap, get_device
 from pixel_flasher_plugin.headless_runtime import runtime as _runtime
 from pixel_flasher_plugin.headless_runtime import run_shell as _run_shell
@@ -2020,6 +2020,221 @@ class DeviceOps:
                 os.remove(local_script)
             except OSError:
                 pass
+
+    # ------------------------------------------------------------------
+    # restic snapshot orchestration (backup "Tier 2": incremental / dedup /
+    # encrypted / offsite). Composes the verified backup_app_data /
+    # restore_app_data primitives with host-side restic commands. restic and
+    # rclone run on the HOST (Mac/VPS), never on the phone; every interpolated
+    # value is shlex.quoted inside restic_backup.py.
+    # ------------------------------------------------------------------
+    def snapshot_app_data(
+        self,
+        packages: list[str],
+        primary_repo: str,
+        staging_dir: str | None = None,
+        copy_repos: list[str] | None = None,
+        tags: list[str] | None = None,
+        keep_daily: int = 7,
+        keep_weekly: int = 5,
+        keep_monthly: int = 12,
+        include_external: bool = False,
+        include_obb: bool = False,
+        confirm: bool = False,
+    ) -> ToolResult:
+        """Pull each package's data and commit it to a restic repo, then copy + prune.
+
+        For each package, reuses ``backup_app_data`` to produce a ``.tar`` in a
+        staging dir, then ``restic backup`` snapshots the whole staging dir
+        into *primary_repo*, ``restic copy`` replicates to each *copy_repos*
+        entry (dedup-preserving), and ``restic forget --prune`` applies the
+        retention policy to every repo. restic reads its password from
+        ``RESTIC_PASSWORD_COMMAND`` / ``RESTIC_FROM_PASSWORD_COMMAND`` in the
+        environment -- never passed here.
+        """
+        if not packages:
+            return ToolResult(success=False, error="packages must be a non-empty list")
+        try:
+            for pkg in packages:
+                package_backup.validate_package_name(pkg)
+            restic_backup.validate_repo(primary_repo)
+            for repo in copy_repos or []:
+                restic_backup.validate_repo(repo)
+        except ValueError as exc:
+            return ToolResult(success=False, error=str(exc))
+
+        stop_subcommand = f"shell am force-stop {self._q(packages[0])}"
+        command = self._adb_cmd(stop_subcommand)
+        blocked = self._evaluate(command, RiskTier.WARN, confirm)
+        if blocked:
+            self._log("snapshot_app_data", command, False)
+            return blocked
+        preflight = self._run_preflight(RiskTier.WARN, expected_mode="adb")
+        if preflight:
+            self._log("snapshot_app_data", command, False)
+            return preflight
+
+        own_staging = staging_dir is None
+        staging = staging_dir or tempfile.mkdtemp(prefix="pf_restic_stage_")
+        try:
+            os.makedirs(staging, exist_ok=True)
+            for pkg in packages:
+                res = self.backup_app_data(
+                    pkg, staging, include_external=include_external,
+                    include_obb=include_obb, confirm=True,
+                )
+                if not res.success:
+                    return ToolResult(success=False, error=f"pull failed for {pkg}: {res.error}", command=command)
+
+            all_tags = list(tags or []) + ["pixel-appdata"]
+            backup_cmd = restic_backup.build_backup_command(primary_repo, staging, all_tags)
+            res = self._run_shell_safe(backup_cmd, timeout=1800)
+            if res.returncode != 0:
+                self._log("snapshot_app_data", command, False)
+                return ToolResult(success=False, error=f"restic backup failed: {res.stderr}", command=command)
+            snapshot_id = restic_backup.parse_snapshot_id(res.stdout)
+
+            copied: list[dict[str, Any]] = []
+            for repo in copy_repos or []:
+                cp_cmd = restic_backup.build_copy_command(repo, primary_repo)
+                r = self._run_shell_safe(cp_cmd, timeout=3600)
+                copied.append({
+                    "repo": repo,
+                    "success": r.returncode == 0,
+                    "error": r.stderr.strip() if r.returncode != 0 else None,
+                })
+
+            pruned: list[str] = []
+            for repo in [primary_repo] + list(copy_repos or []):
+                fc_cmd = restic_backup.build_forget_command(repo, keep_daily, keep_weekly, keep_monthly)
+                r = self._run_shell_safe(fc_cmd, timeout=1800)
+                if r.returncode == 0:
+                    pruned.append(repo)
+
+            self._log("snapshot_app_data", command, True)
+            return ToolResult(
+                success=True,
+                data={
+                    "packages": packages,
+                    "primary_repo": primary_repo,
+                    "snapshot_id": snapshot_id,
+                    "copied": copied,
+                    "pruned_repos": pruned,
+                },
+                command=command,
+            )
+        except Exception as exc:
+            self._log("snapshot_app_data", None, False)
+            return self._tool_error("snapshot_app_data", exc)
+        finally:
+            if own_staging:
+                shutil.rmtree(staging, ignore_errors=True)
+
+    def restore_from_snapshot(
+        self,
+        packages: list[str],
+        repo: str,
+        snapshot: str = "latest",
+        staging_dir: str | None = None,
+        include_external: bool = False,
+        include_obb: bool = False,
+        confirm: bool = False,
+    ) -> ToolResult:
+        """Restore package data from a restic snapshot back onto the device.
+
+        ``restic restore`` recreates the staged ``.tar`` files, then each is
+        fed to the verified ``restore_app_data`` (push + chown + SELinux). The
+        apps must already be installed (data only, not the APK).
+        """
+        if not packages:
+            return ToolResult(success=False, error="packages must be a non-empty list")
+        try:
+            for pkg in packages:
+                package_backup.validate_package_name(pkg)
+            restic_backup.validate_repo(repo)
+            restic_backup.validate_snapshot(snapshot)
+        except ValueError as exc:
+            return ToolResult(success=False, error=str(exc))
+
+        stop_subcommand = f"shell am force-stop {self._q(packages[0])}"
+        command = self._adb_cmd(stop_subcommand)
+        blocked = self._evaluate(command, RiskTier.WARN, confirm)
+        if blocked:
+            self._log("restore_from_snapshot", command, False)
+            return blocked
+        preflight = self._run_preflight(RiskTier.WARN, expected_mode="adb")
+        if preflight:
+            self._log("restore_from_snapshot", command, False)
+            return preflight
+
+        own_staging = staging_dir is None
+        staging = staging_dir or tempfile.mkdtemp(prefix="pf_restic_restore_")
+        try:
+            os.makedirs(staging, exist_ok=True)
+            restore_cmd = restic_backup.build_restore_command(repo, snapshot, staging)
+            res = self._run_shell_safe(restore_cmd, timeout=1800)
+            if res.returncode != 0:
+                self._log("restore_from_snapshot", command, False)
+                return ToolResult(success=False, error=f"restic restore failed: {res.stderr}", command=command)
+
+            results: list[dict[str, Any]] = []
+            for pkg in packages:
+                tar_path = self._find_in_tree(staging, f"{pkg}_backup.tar")
+                if not tar_path:
+                    results.append({"package": pkg, "success": False, "error": "tar not found in snapshot"})
+                    continue
+                r = self.restore_app_data(
+                    pkg, tar_path, include_external=include_external,
+                    include_obb=include_obb, confirm=True,
+                )
+                results.append({"package": pkg, "success": r.success, "error": r.error})
+
+            overall = all(item["success"] for item in results)
+            self._log("restore_from_snapshot", command, overall)
+            return ToolResult(
+                success=overall,
+                data={"repo": repo, "snapshot": snapshot, "results": results},
+                command=command,
+            )
+        except Exception as exc:
+            self._log("restore_from_snapshot", None, False)
+            return self._tool_error("restore_from_snapshot", exc)
+        finally:
+            if own_staging:
+                shutil.rmtree(staging, ignore_errors=True)
+
+    def list_app_snapshots(self, repo: str) -> ToolResult:
+        """List restic snapshots in *repo* (read-only host command, no device)."""
+        try:
+            restic_backup.validate_repo(repo)
+        except ValueError as exc:
+            return ToolResult(success=False, error=str(exc))
+        cmd = restic_backup.build_snapshots_command(repo)
+        try:
+            res = self._run_shell_safe(cmd, timeout=120)
+            if res.returncode != 0:
+                return ToolResult(success=False, error=f"restic snapshots failed: {res.stderr}", command=cmd)
+            snapshots = json.loads(res.stdout or "[]")
+            summary = [
+                {
+                    "id": s.get("short_id") or (s.get("id", "")[:8]),
+                    "time": s.get("time"),
+                    "tags": s.get("tags", []),
+                    "paths": s.get("paths", []),
+                }
+                for s in snapshots
+            ]
+            return ToolResult(success=True, data={"repo": repo, "count": len(summary), "snapshots": summary}, command=cmd)
+        except Exception as exc:
+            return self._tool_error("list_app_snapshots", exc)
+
+    @staticmethod
+    def _find_in_tree(root: str, filename: str) -> str | None:
+        """Return the first path under *root* whose basename is *filename*."""
+        for dirpath, _dirs, files in os.walk(root):
+            if filename in files:
+                return os.path.join(dirpath, filename)
+        return None
 
     def read_partition(
         self,

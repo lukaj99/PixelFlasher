@@ -63,6 +63,43 @@ dependencies — the headless server never needs them.
 - All shell commands pass through `command_validator.py`'s allow-list and the
   `safety_engine.py` gateway before execution.
 
+## App-data backup tiers
+
+**Tier 1 — on-device (Neo Backup).** `create_backup_schedule` /
+`trigger_app_backup` drive Neo Backup for convenient, app-granular,
+restore-from-the-phone backups. `backup_app_data` / `restore_app_data` do a
+one-shot, app-independent root `tar --selinux` of a package's private data.
+
+**Tier 2 — host-side restic (incremental / dedup / encrypted / offsite).**
+`snapshot_app_data` pulls each package's tar into a staging dir and commits it
+to a [restic](https://restic.net) repo, then `restic copy` replicates
+(dedup-preserving) to secondary repos for a 3-2-1 setup;
+`restore_from_snapshot` and `list_app_snapshots` complete the loop. restic and
+rclone run on the **host** (Mac/VPS), never on the phone.
+
+One-time repo setup (do this on the Mac before first `snapshot_app_data`):
+
+```bash
+# Password comes from Bitwarden -- never stored in plaintext or passed as a param.
+export RESTIC_PASSWORD_COMMAND='bw-wrapper get "restic-pixel"'
+export RESTIC_FROM_PASSWORD_COMMAND='bw-wrapper get "restic-pixel"'   # for `copy`
+
+# Primary (fast, local) + two replicas (offsite + fast LAN):
+restic -r /Volumes/backup/restic-pixel init
+restic -r rclone:gdrive:backups/pixel   init --from-repo /Volumes/backup/restic-pixel --copy-chunker-params
+restic -r sftp:luka@vps:/home/luka/restic-pixel init --from-repo /Volumes/backup/restic-pixel --copy-chunker-params
+```
+
+`--copy-chunker-params` on the copy targets is **required** — without it
+`restic copy` re-chunks everything and cross-repo dedup is lost. Set both
+`RESTIC_*_PASSWORD_COMMAND` vars in the environment that launches the MCP server
+(e.g. add them to `.mcp.json`'s `env`, sourcing from `bw-wrapper`).
+
+Then a nightly snapshot over USB is one tool call, e.g.:
+`snapshot_app_data(device_id, packages=[...], primary_repo="/Volumes/backup/restic-pixel",
+copy_repos=["rclone:gdrive:backups/pixel", "sftp:luka@vps:/home/luka/restic-pixel"],
+dry_run=False, confirm=True)`.
+
 ## Tests
 
 ```bash
