@@ -1,6 +1,6 @@
 """PixelFlasher MCP server adapter.
 
-This module exposes the PixelFlasher device-operation facade as 36 MCP tools
+This module exposes the PixelFlasher device-operation facade as 43 MCP tools
 that AI agents can call.  It bootstraps the headless runtime once at startup
 and shares the same SafetyGateway across all tool invocations.
 """

@@ -25,8 +25,8 @@ import pytest
 EXPECTED_TOOL_COUNT = 43
 
 
-def test_exactly_34_tools_registered(mcp_server_module) -> None:
-    """The MCP server MUST register exactly 34 tools."""
+def test_expected_tool_count_registered(mcp_server_module) -> None:
+    """The MCP server MUST register exactly EXPECTED_TOOL_COUNT tools."""
     mcp = mcp_server_module.mcp
     tools = mcp._tool_manager._tools
     assert len(tools) == EXPECTED_TOOL_COUNT, (
