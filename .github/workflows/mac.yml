@@ -130,6 +130,9 @@ jobs:
           allowlist_patterns = [
             # Add glob patterns for extension-module paths to exempt from universal2 checks.
             # Example: "*/site-packages/somepkg/someext*.so"
+            # Skip MCP / Pydantic dependencies which are only used headlessly and not in the app bundle
+            "*/site-packages/rpds/*",
+            "*/site-packages/pydantic_core/*",
           ]
 
           def iter_site_package_roots() -> list[pathlib.Path]:
